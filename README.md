@@ -1,6 +1,6 @@
 # 📊 Seguimiento FARO — Cronograma de Avance
 
-Tablero para dar seguimiento al avance del Proyecto FARO (Wave 1): tareas por fase, horas por persona y vista ejecutiva.
+Tablero para dar seguimiento al avance del Proyecto FARO (Wave 1): tareas por fase, horas por persona, vista ejecutiva e histórico de cortes.
 
 **👉 App publicada: https://aaronzaso.github.io/Seguimiento-FARO/**
 
@@ -10,8 +10,10 @@ No hay que instalar nada: se abre en el navegador. Cada quien trabaja en su nave
 
 1. **Ver el avance**: abrí la URL de arriba. La primera vez, la app carga automáticamente el último Excel publicado por el equipo. Si ya la habías usado, presioná **🔄 Cargar** en la barra morada para traer los datos publicados.
 2. **Registrar tu avance**: actualizá el % de tus tareas, tus horas y notas.
-3. **Compartirlo**: presioná **📥 Exportar Excel** y subí el archivo descargado a la carpeta [`datos/`](datos/) del repo (en GitHub: `datos/` → **Add file → Upload files** → arrastrar → **Commit changes**). No le cambiés el nombre.
+3. **Compartirlo**: presioná **📥 Exportar Excel** y subí el archivo descargado a la carpeta [`datos/`](datos/) del repo (en GitHub: `datos/` → **Add file → Upload files** → arrastrar → **Commit changes**). No le cambiés el nombre. La exportación conserva los cortes anteriores y agrega o actualiza el corte del día.
 4. En ~1 minuto la página se actualiza sola con el nuevo Excel y todos pueden cargarlo.
+
+La pestaña **🕘 Histórico** muestra el avance general y por fase de cada corte guardado en la hoja `Histórico avance` del Excel.
 
 También podés importar cualquier Excel exportado con **📤 Importar Excel** (por si lo compartieron por Teams/correo).
 

@@ -1,6 +1,6 @@
 # 📂 datos/ — Registro oficial del avance
 
-Aquí se guardan los Excel exportados desde la app. El archivo **más reciente** (por la fecha en el nombre) se publica automáticamente en la página y todos lo pueden cargar con un clic.
+Aquí se guardan los Excel exportados desde la app. El archivo **más reciente** (por la fecha en el nombre) se publica automáticamente en la página y todos lo pueden cargar con un clic. Cada archivo conserva en la hoja `Histórico avance` los cortes anteriores y el corte del día.
 
 ## Cómo actualizar el avance del equipo
 

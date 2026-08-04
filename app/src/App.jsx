@@ -130,6 +130,7 @@ export default function App() {
   const [exp, setExp] = useState(null);
   const [ready, setReady] = useState(false);
   const [note, setNote] = useState("");
+  const [history, setHistory] = useState([]);
   const [importMsg, setImportMsg] = useState(null);
   const [published, setPublished] = useState(null);
   const fileRef = useRef(null);
@@ -158,6 +159,7 @@ export default function App() {
           const d = JSON.parse(raw);
           if (d.tasks && Array.isArray(d.tasks)) { setTasks(d.tasks.map(migrateTask)); hasLocal = true; }
           if (typeof d.note === "string") setNote(d.note);
+          if (Array.isArray(d.history)) setHistory(d.history);
         }
       } catch (err) { console.error("Load:", err); }
 
@@ -166,6 +168,7 @@ export default function App() {
         const pub = await fetchPublishedData();
         if (!cancelled && pub) {
           setPublished(pub);
+          if (pub.history?.length) setHistory(pub.history);
           if (!hasLocal) applyUpdates(pub.updates); // first visit: start from the team's published data
         }
       } catch (err) { console.error("Published:", err); }
@@ -178,9 +181,9 @@ export default function App() {
   // Save (debounced)
   useEffect(() => {
     if (!ready) return;
-    const t = setTimeout(() => { storageSet(SK, JSON.stringify({ tasks, note })); }, 400);
+    const t = setTimeout(() => { storageSet(SK, JSON.stringify({ tasks, note, history })); }, 400);
     return () => clearTimeout(t);
-  }, [tasks, note, ready]);
+  }, [tasks, note, history, ready]);
 
   const updateTask = useCallback((id, updates) => {
     setTasks(prev => prev.map(t => t.id === id ? { ...t, ...updates } : t));
@@ -223,9 +226,10 @@ export default function App() {
     const file = e.target.files?.[0];
     if (!file) return;
     try {
-      const updates = await importFromExcel(file);
-      applyUpdates(updates);
-      setImportMsg({ ok: true, text: `Se actualizaron ${Object.keys(updates).length} tareas correctamente.` });
+      const imported = await importFromExcel(file);
+      applyUpdates(imported.updates);
+      if (imported.history?.length) setHistory(imported.history);
+      setImportMsg({ ok: true, text: `Se actualizaron ${Object.keys(imported.updates).length} tareas correctamente.` });
     } catch (err) {
       setImportMsg({ ok: false, text: err.message });
     }
@@ -276,13 +280,13 @@ export default function App() {
         {/* Tabs + Actions */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 14, flexWrap: "wrap", gap: 8 }}>
           <div style={{ display: "flex", gap: 4, background: "rgba(255,255,255,.06)", borderRadius: 10, padding: 3 }}>
-            {[["avance", "📊 Avance"], ["ejecutivo", "📈 Ejecutivo"]].map(([k, l]) => (
+            {[["avance", "📊 Avance"], ["ejecutivo", "📈 Ejecutivo"], ["historico", "🕘 Histórico"]].map(([k, l]) => (
               <button key={k} onClick={() => setTab(k)} style={{ padding: "7px 20px", borderRadius: 8, border: "none", fontSize: 12, fontWeight: 700, cursor: "pointer",
                 background: tab === k ? "rgba(255,255,255,.15)" : "transparent", color: tab === k ? "white" : "rgba(255,255,255,.4)", transition: "all .15s" }}>{l}</button>
             ))}
           </div>
           <div style={{ display: "flex", gap: 6 }}>
-            <button onClick={() => exportToExcel(tasks)}
+            <button onClick={() => exportToExcel(tasks, history, note)}
               style={{ padding: "6px 14px", borderRadius: 8, border: "1px solid rgba(255,255,255,.2)", background: "rgba(255,255,255,.08)",
                 color: "rgba(255,255,255,.8)", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
               📥 Exportar Excel
@@ -308,6 +312,7 @@ export default function App() {
           </span>
           <button onClick={() => {
             applyUpdates(published.updates);
+            if (published.history?.length) setHistory(published.history);
             setImportMsg({ ok: true, text: `Se cargaron los datos publicados (${Object.keys(published.updates).length} tareas).` });
             setTimeout(() => setImportMsg(null), 5000);
           }}
@@ -328,10 +333,11 @@ export default function App() {
         </div>
       )}
 
-      {tab === "avance"
-        ? <AvanceTab tasks={tasks} filtered={filtered} fp={fp} setFp={setFp} fm={fm} setFm={setFm} exp={exp} setExp={setExp} updateTask={updateTask} stats={stats} setTasks={setTasks} />
-        : <EjecTab stats={stats} tasks={tasks} note={note} setNote={setNote} />
-      }
+      {tab === "avance" && (
+        <AvanceTab tasks={tasks} filtered={filtered} fp={fp} setFp={setFp} fm={fm} setFm={setFm} exp={exp} setExp={setExp} updateTask={updateTask} stats={stats} setTasks={setTasks} />
+      )}
+      {tab === "ejecutivo" && <EjecTab stats={stats} tasks={tasks} note={note} setNote={setNote} />}
+      {tab === "historico" && <HistoryTab history={history} />}
     </div>
   );
 }
@@ -483,6 +489,110 @@ function AvanceTab({ tasks, filtered, fp, setFp, fm, setFm, exp, setExp, updateT
         })()}
       </div>
     </>
+  );
+}
+
+function HistoryTab({ history }) {
+  const cuts = useMemo(
+    () => [...history].filter(cut => cut?.date).sort((a, b) => b.date.localeCompare(a.date)),
+    [history],
+  );
+  const latest = cuts[0];
+  const previous = cuts[1];
+  const latestDelta = latest && previous ? Math.round((latest.global - previous.global) * 10) / 10 : null;
+  const pct = value => `${Number(value || 0).toLocaleString("es-CR", { maximumFractionDigits: 1 })}%`;
+  const cutDate = value => new Date(`${value}T12:00:00`).toLocaleDateString("es-CR", {
+    day: "2-digit", month: "long", year: "numeric",
+  });
+
+  if (cuts.length === 0) {
+    return (
+      <div style={{ padding: "24px 28px 40px", maxWidth: 940 }}>
+        <div style={{ background: "white", borderRadius: 12, padding: 28, textAlign: "center" }}>
+          <div style={{ fontSize: 28, marginBottom: 8 }}>🕘</div>
+          <h2 style={{ margin: "0 0 6px", fontSize: 17, color: GT.purple }}>Todavía no hay cortes históricos</h2>
+          <p style={{ margin: 0, fontSize: 12, color: "#888" }}>
+            Al cargar o exportar un Excel con la hoja “Histórico avance”, los cortes aparecerán aquí.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ padding: "24px 28px 40px", maxWidth: 1000 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 18, flexWrap: "wrap", marginBottom: 18 }}>
+        <div>
+          <h2 style={{ margin: "0 0 5px", fontSize: 18, color: GT.purple }}>Histórico de avance</h2>
+          <p style={{ margin: 0, fontSize: 11, color: "#888", maxWidth: 620, lineHeight: 1.5 }}>
+            Cada Excel publicado conserva los cortes anteriores. Si se exporta más de una vez el mismo día, se actualiza ese corte sin duplicarlo.
+          </p>
+        </div>
+        <div style={{ fontSize: 10, color: "#999", padding: "6px 10px", borderRadius: 7, background: "white", border: `1px solid ${GT.warmGreyLight}` }}>
+          Fuente oficial: hoja “Histórico avance”
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 10, marginBottom: 18 }}>
+        {[
+          { label: "Último avance", value: pct(latest.global), detail: cutDate(latest.date), color: GT.purple },
+          { label: "Cambio", value: latestDelta === null ? "—" : `${latestDelta > 0 ? "+" : ""}${pct(latestDelta)}`, detail: previous ? "vs. corte anterior" : "primer corte", color: latestDelta >= 0 ? GT.greenDark : GT.red },
+          { label: "Cortes registrados", value: cuts.length, detail: "sin sobrescribir el histórico", color: GT.teal },
+        ].map(card => (
+          <div key={card.label} style={{ background: "white", borderRadius: 12, padding: 15, borderTop: `3px solid ${card.color}` }}>
+            <div style={{ fontSize: 9, fontWeight: 700, color: "#999", textTransform: "uppercase", letterSpacing: 1 }}>{card.label}</div>
+            <div style={{ fontSize: 25, fontWeight: 800, fontFamily: "'JetBrains Mono',monospace", color: card.color, marginTop: 3 }}>{card.value}</div>
+            <div style={{ fontSize: 10, color: "#aaa", marginTop: 2 }}>{card.detail}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {cuts.map((cut, index) => {
+          const older = cuts[index + 1];
+          const delta = older ? Math.round((cut.global - older.global) * 10) / 10 : null;
+          return (
+            <div key={`${cut.date}-${index}`} style={{ background: "white", borderRadius: 12, padding: "16px 18px", borderLeft: `4px solid ${index === 0 ? GT.purple : GT.warmGrey}` }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
+                <div>
+                  <div style={{ fontSize: 12, fontWeight: 800, color: GT.black }}>{cutDate(cut.date)}</div>
+                  <div style={{ display: "flex", gap: 7, alignItems: "center", marginTop: 4, flexWrap: "wrap" }}>
+                    {index === 0 && <span style={{ fontSize: 9, fontWeight: 700, color: GT.purple, background: GT.purpleBg, padding: "2px 7px", borderRadius: 4 }}>ÚLTIMO CORTE</span>}
+                    {cut.branch && <span style={{ fontSize: 10, color: "#888" }}>Rama: <strong>{cut.branch}</strong></span>}
+                    {cut.commit && <span style={{ fontSize: 10, color: "#888", fontFamily: "'JetBrains Mono',monospace" }}>Commit: {cut.commit}</span>}
+                  </div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 25, fontWeight: 800, fontFamily: "'JetBrains Mono',monospace", color: index === 0 ? GT.purple : GT.black }}>{pct(cut.global)}</div>
+                  <div style={{ fontSize: 10, color: delta === null ? "#aaa" : delta >= 0 ? GT.greenDark : GT.red, fontWeight: 700 }}>
+                    {delta === null ? "Punto de partida" : `${delta > 0 ? "+" : ""}${pct(delta)} desde el corte anterior`}
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ height: 7, background: GT.warmGreyLight, borderRadius: 4, overflow: "hidden", margin: "13px 0 12px" }}>
+                <div style={{ width: `${Math.max(0, Math.min(100, cut.global))}%`, height: "100%", background: index === 0 ? GT.purple : GT.warmGrey, borderRadius: 4 }} />
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(135px,1fr))", gap: 7 }}>
+                {PHASES.map(phase => (
+                  <div key={phase.name} style={{ padding: "7px 9px", borderRadius: 8, background: phase.bg, display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+                    <span style={{ fontSize: 9.5, fontWeight: 700, color: phase.color, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{phase.name}</span>
+                    <span style={{ fontSize: 10, fontWeight: 800, color: phase.color, fontFamily: "'JetBrains Mono',monospace" }}>{pct(cut.phases?.[phase.name])}</span>
+                  </div>
+                ))}
+              </div>
+
+              {cut.notes && (
+                <div style={{ marginTop: 11, paddingTop: 10, borderTop: `1px solid ${GT.warmGreyLight}`, fontSize: 10.5, lineHeight: 1.5, color: "#777" }}>
+                  <strong style={{ color: GT.purple }}>Evidencia:</strong> {cut.notes}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 

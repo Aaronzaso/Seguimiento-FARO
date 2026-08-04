@@ -1,8 +1,107 @@
 import * as XLSX from "xlsx";
-import { TEAM, PHASES, sumH, gtm } from "./constants";
+import { TEAM, PHASES, sumH, gtm } from "./constants.js";
+
+const HISTORY_SHEET_NAMES = ["histórico avance", "historico avance", "histórico", "historico"];
+const HISTORY_PHASE_COLUMNS = [
+  { phase: "Levantamiento", header: "Levantamiento" },
+  { phase: "Diseño", header: "Diseño" },
+  { phase: "Desarrollo", header: "Desarrollo" },
+  { phase: "Pruebas", header: "Pruebas" },
+  { phase: "Impl. y Transferencia", header: "Impl. y transferencia" },
+  { phase: "Migración de Datos", header: "Migración de datos" },
+];
+
+const round1 = value => Math.round(value * 10) / 10;
+
+function todayKey() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function dateKey(value) {
+  if (value === undefined || value === null || value === "") return "";
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const date = new Date(Date.UTC(1899, 11, 30) + Math.floor(value) * 86400000);
+    return date.toISOString().slice(0, 10);
+  }
+
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    const year = value.getFullYear();
+    const month = String(value.getMonth() + 1).padStart(2, "0");
+    const day = String(value.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+
+  const text = String(value).trim();
+  const iso = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+
+  const local = text.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})$/);
+  if (local) return `${local[3]}-${local[2].padStart(2, "0")}-${local[1].padStart(2, "0")}`;
+
+  const parsed = new Date(text);
+  return Number.isNaN(parsed.getTime()) ? "" : parsed.toISOString().slice(0, 10);
+}
+
+function percentValue(value) {
+  if (value === undefined || value === null || value === "") return 0;
+  const hasPercentSymbol = typeof value === "string" && value.includes("%");
+  const numeric = typeof value === "string"
+    ? Number(value.replace("%", "").replace(",", ".").trim())
+    : Number(value);
+  if (!Number.isFinite(numeric)) return 0;
+  const normalized = !hasPercentSymbol && Math.abs(numeric) <= 1 ? numeric * 100 : numeric;
+  return round1(Math.max(0, Math.min(100, normalized)));
+}
+
+function calculateProgress(tasks) {
+  const totalHours = tasks.reduce((sum, task) => sum + task.hours, 0);
+  const completedHours = tasks.reduce((sum, task) => sum + task.hours * task.progress / 100, 0);
+  const phases = {};
+
+  PHASES.forEach(phase => {
+    const phaseTasks = tasks.filter(task => task.phase === phase.name);
+    const hours = phaseTasks.reduce((sum, task) => sum + task.hours, 0);
+    const completed = phaseTasks.reduce((sum, task) => sum + task.hours * task.progress / 100, 0);
+    phases[phase.name] = hours > 0
+      ? round1(completed / hours * 100)
+      : (phaseTasks.length > 0 && phaseTasks.every(task => task.progress === 100) ? 100 : 0);
+  });
+
+  return {
+    global: totalHours > 0 ? round1(completedHours / totalHours * 100) : 0,
+    phases,
+  };
+}
+
+export function buildHistoryCut(tasks, previousHistory = [], note = "") {
+  const date = todayKey();
+  const progress = calculateProgress(tasks);
+  const previous = previousHistory.find(cut => cut.date === date);
+
+  return {
+    date,
+    global: progress.global,
+    phases: progress.phases,
+    branch: previous?.branch || "Seguimiento-FARO",
+    commit: previous?.commit || "",
+    notes: note.trim() || previous?.notes || "Corte exportado desde el tablero de seguimiento.",
+  };
+}
+
+function withCurrentCut(tasks, history, note) {
+  const normalized = Array.isArray(history) ? history.filter(cut => cut?.date) : [];
+  const current = buildHistoryCut(tasks, normalized, note);
+  return [...normalized.filter(cut => cut.date !== current.date), current]
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
 
 // ═══ EXPORT ═══
-export function exportToExcel(tasks) {
+export function exportToExcel(tasks, history = [], note = "") {
   const rows = tasks.map(t => {
     const respNames = t.responsible.map(id => gtm(id).name).join(", ");
     const tHL = sumH(t.hoursBy);
@@ -84,7 +183,39 @@ export function exportToExcel(tasks) {
   ws3["!cols"] = [{ wch: 20 }, { wch: 6 }, { wch: 12 }, { wch: 16 }, { wch: 13 }];
   XLSX.utils.book_append_sheet(wb, ws3, "Equipo");
 
-  XLSX.writeFile(wb, `FARO_Cronograma_${new Date().toISOString().slice(0, 10)}.xlsx`);
+  // History sheet: one row per review date. Exporting again on the same day updates that day's cut.
+  const historyRows = withCurrentCut(tasks, history, note).map(cut => {
+    const row = {
+      "Fecha del corte": new Date(`${cut.date}T12:00:00`),
+      "Avance general": cut.global / 100,
+    };
+
+    HISTORY_PHASE_COLUMNS.forEach(({ phase, header }) => {
+      row[header] = (cut.phases?.[phase] || 0) / 100;
+    });
+
+    row["Rama revisada"] = cut.branch || "";
+    row["Commit"] = cut.commit || "";
+    row["Notas / evidencia"] = cut.notes || "";
+    return row;
+  });
+
+  const ws4 = XLSX.utils.json_to_sheet(historyRows, { dateNF: "dd/mm/yyyy" });
+  ws4["!cols"] = [
+    { wch: 16 }, { wch: 15 }, { wch: 15 }, { wch: 12 }, { wch: 13 }, { wch: 11 },
+    { wch: 22 }, { wch: 20 }, { wch: 28 }, { wch: 14 }, { wch: 62 },
+  ];
+  if (historyRows.length > 0) {
+    for (let row = 2; row <= historyRows.length + 1; row += 1) {
+      ws4[`A${row}`].z = "dd/mm/yyyy";
+      for (const col of ["B", "C", "D", "E", "F", "G", "H"]) {
+        ws4[`${col}${row}`].z = "0.0%";
+      }
+    }
+  }
+  XLSX.utils.book_append_sheet(wb, ws4, "Histórico avance");
+
+  XLSX.writeFile(wb, `FARO_Cronograma_${todayKey()}.xlsx`);
 }
 
 // ═══ IMPORT ═══
@@ -178,13 +309,43 @@ export function parseWorkbookUpdates(arrayBuffer) {
   return updates;
 }
 
+export function parseWorkbookHistory(arrayBuffer) {
+  const data = new Uint8Array(arrayBuffer);
+  const wb = XLSX.read(data, { type: "array" });
+  const sheetName = wb.SheetNames.find(name => HISTORY_SHEET_NAMES.includes(name.toLowerCase()));
+  if (!sheetName) return [];
+
+  const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { defval: "", raw: true });
+  return rows.map(row => {
+    const date = dateKey(row["Fecha del corte"] ?? row["Fecha"] ?? row["Corte"]);
+    if (!date) return null;
+
+    const phases = {};
+    HISTORY_PHASE_COLUMNS.forEach(({ phase, header }) => {
+      phases[phase] = percentValue(row[header] ?? row[phase]);
+    });
+
+    return {
+      date,
+      global: percentValue(row["Avance general"] ?? row["Avance Global"] ?? row["Avance"]),
+      phases,
+      branch: String(row["Rama revisada"] ?? row["Rama"] ?? "").trim(),
+      commit: String(row["Commit"] ?? "").trim(),
+      notes: String(row["Notas / evidencia"] ?? row["Notas"] ?? row["Evidencia"] ?? "").trim(),
+    };
+  }).filter(Boolean).sort((a, b) => a.date.localeCompare(b.date));
+}
+
 export function importFromExcel(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
 
     reader.onload = (e) => {
       try {
-        resolve(parseWorkbookUpdates(e.target.result));
+        resolve({
+          updates: parseWorkbookUpdates(e.target.result),
+          history: parseWorkbookHistory(e.target.result),
+        });
       } catch (err) {
         reject(new Error("Error leyendo el archivo: " + err.message));
       }
@@ -197,15 +358,16 @@ export function importFromExcel(file) {
 
 // ═══ PUBLISHED DATA ═══
 // The deploy workflow publishes the latest Excel from datos/ as datos/FARO_Cronograma.xlsx
-// next to the app. Returns { updates, lastModified } or null if there is no published file.
+// next to the app. Returns { updates, history, lastModified } or null if there is no published file.
 export async function fetchPublishedData() {
   try {
     const res = await fetch("./datos/FARO_Cronograma.xlsx", { cache: "no-store" });
     if (!res.ok) return null;
     const buf = await res.arrayBuffer();
     const updates = parseWorkbookUpdates(buf);
+    const history = parseWorkbookHistory(buf);
     const lm = res.headers.get("Last-Modified");
-    return { updates, lastModified: lm ? new Date(lm) : null };
+    return { updates, history, lastModified: lm ? new Date(lm) : null };
   } catch {
     return null;
   }
