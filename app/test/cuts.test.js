@@ -12,7 +12,12 @@ import {
 } from "../src/excel.js";
 import handler, { normalizeSavePayload } from "../api/cuts.js";
 import sessionHandler from "../api/session.js";
-import { authenticateToken, createSession, verifySession } from "../lib/faro-auth.js";
+import {
+  assertTrustedOrigin,
+  authenticateToken,
+  createSession,
+  verifySession,
+} from "../lib/faro-auth.js";
 
 const ORIGIN = "https://faro.example";
 const SESSION_SECRET = "session-secret-for-tests-1234567890";
@@ -337,6 +342,23 @@ test("crea una sesión HttpOnly sin devolver la clave al navegador", async () =>
     if (originalSessionSecret === undefined) delete process.env.FARO_SESSION_SECRET;
     else process.env.FARO_SESSION_SECRET = originalSessionSecret;
   }
+});
+
+test("acepta aliases same-origin de Vercel y rechaza sitios externos", () => {
+  const previewHeaders = {
+    origin: "https://seguimiento-faro-git-main-preview.vercel.app",
+    host: "seguimiento-faro-git-main-preview.vercel.app",
+    "x-forwarded-proto": "https",
+  };
+  const env = { FARO_ALLOWED_ORIGIN: "https://seguimiento-faro.vercel.app" };
+
+  assert.doesNotThrow(() => assertTrustedOrigin({ headers: previewHeaders }, env));
+  assert.throws(
+    () => assertTrustedOrigin({
+      headers: { ...previewHeaders, origin: "https://sitio-ajeno.example" },
+    }, env),
+    /Origen de la solicitud no permitido/,
+  );
 });
 
 test("expone metadatos de versión sin descargar el Excel en el cliente", async () => {

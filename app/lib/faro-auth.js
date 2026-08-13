@@ -249,7 +249,11 @@ export function assertTrustedOrigin(req, env = process.env) {
     .split(",")
     .map(value => value.trim().replace(/\/$/, ""))
     .filter(Boolean);
-  const allowed = configured.length > 0 ? configured : [requestOrigin(req)].filter(Boolean);
+  // Vercel can serve the same production deployment from its canonical domain,
+  // branch aliases and immutable deployment URL. The request host is trusted by
+  // the platform, so same-origin writes remain valid across those aliases while
+  // configured domains continue to allow an explicit canonical/custom origin.
+  const allowed = [...new Set([...configured, requestOrigin(req)].filter(Boolean))];
   if (!received || !allowed.includes(received)) {
     throw new FaroAuthError(403, "Origen de la solicitud no permitido.", "ORIGIN_FORBIDDEN");
   }
