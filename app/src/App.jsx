@@ -34,6 +34,12 @@ function sameDraft(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function formatHours(value) {
+  return Number(value || 0).toLocaleString("es-CR", {
+    maximumFractionDigits: 1,
+  });
+}
+
 function DragBar({ value, color, onChange, h = 8 }) {
   const ref = useRef(null);
   const dragging = useRef(false);
@@ -950,7 +956,7 @@ const sel = { padding: "7px 12px", borderRadius: 8, border: `1px solid #E8E5E1`,
 // ═══ EJECUTIVO TAB ═══
 function EjecTab({ stats, tasks, note, setNote }) {
   return (
-    <div style={{ padding: "24px 28px 40px", maxWidth: 940 }}>
+    <div style={{ padding: "clamp(16px, 2vw, 28px) clamp(16px, 2.4vw, 36px) 40px", width: "100%", boxSizing: "border-box" }}>
       {/* Deadline Gauge */}
       <DeadlineGauge globalPct={stats.global} />
 
@@ -961,11 +967,11 @@ function EjecTab({ stats, tasks, note, setNote }) {
           { l: "Completadas", v: `${stats.done}`, s: `de ${tasks.length} tareas`, a: GT.greenDark },
           { l: "En Progreso", v: `${stats.inP}`, s: "tareas activas", a: GT.orange },
           { l: "Pendientes", v: `${stats.pend}`, s: "por iniciar", a: GT.warmGrey },
-          { l: "Horas Reales", v: `${stats.hL}`, s: `de ${stats.tH}h plan`, a: GT.teal },
+          { l: "Horas Reales", v: formatHours(stats.hL), s: `de ${formatHours(stats.tH)}h plan`, a: GT.teal },
         ].map((k, i) => (
-          <div key={i} style={{ background: "white", borderRadius: 12, padding: "14px 12px", borderTop: `3px solid ${k.a}` }}>
+          <div key={i} style={{ background: "white", borderRadius: 12, padding: "14px 12px", borderTop: `3px solid ${k.a}`, minWidth: 0 }}>
             <div style={{ fontSize: 9, fontWeight: 700, color: "#999", textTransform: "uppercase", letterSpacing: 1 }}>{k.l}</div>
-            <div style={{ fontSize: 26, fontWeight: 800, fontFamily: "'JetBrains Mono',monospace", color: k.a, marginTop: 3 }}>{k.v}</div>
+            <div style={{ fontSize: "clamp(21px, 2vw, 28px)", fontWeight: 800, fontFamily: "'JetBrains Mono',monospace", color: k.a, marginTop: 3, overflowWrap: "anywhere" }}>{k.v}</div>
             <div style={{ fontSize: 10, color: "#aaa", marginTop: 1 }}>{k.s}</div>
           </div>
         ))}
@@ -976,13 +982,13 @@ function EjecTab({ stats, tasks, note, setNote }) {
         <h3 style={{ margin: "0 0 14px", fontSize: 14, fontWeight: 800, color: GT.purple }}>Avance por Fase</h3>
         {stats.phases.map(p => (
           <div key={p.name} style={{ marginBottom: 14 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 5 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", rowGap: 4, marginBottom: 5 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", minWidth: 0 }}>
                 <span style={{ width: 9, height: 9, borderRadius: 3, background: p.bg, border: `1.5px solid ${p.color}`, display: "inline-block" }} />
                 <span style={{ fontSize: 12, fontWeight: 700, color: p.color }}>{p.name}</span>
-                <span style={{ fontSize: 10, color: GT.warmGrey }}>{p.done}/{p.tasks} · {p.hours}h plan{p.hL > 0 && ` · ${p.hL}h real`}</span>
+                <span style={{ fontSize: 10, color: GT.warmGrey }}>{p.done}/{p.tasks} · {formatHours(p.hours)}h plan{p.hL > 0 && ` · ${formatHours(p.hL)}h real`}</span>
               </div>
-              <span style={{ fontSize: 14, fontWeight: 800, fontFamily: "'JetBrains Mono',monospace", color: p.color }}>{p.pct}%</span>
+              <span style={{ fontSize: 14, fontWeight: 800, fontFamily: "'JetBrains Mono',monospace", color: p.color, flexShrink: 0 }}>{p.pct}%</span>
             </div>
             <div style={{ height: 10, background: p.bg, borderRadius: 5, overflow: "hidden" }}>
               <div style={{ width: `${p.pct}%`, height: "100%", background: p.color, borderRadius: 5, transition: "width .5s", opacity: .8 }} />
@@ -992,7 +998,7 @@ function EjecTab({ stats, tasks, note, setNote }) {
       </div>
 
       {/* Active / Done */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 18 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(min(320px,100%),1fr))", gap: 14, marginBottom: 18 }}>
         <div style={{ background: "white", borderRadius: 12, padding: 16 }}>
           <h3 style={{ margin: "0 0 10px", fontSize: 13, fontWeight: 800, color: GT.teal }}>🔵 En Curso</h3>
           {stats.active.length === 0 ? <div style={{ fontSize: 11, color: GT.warmGrey, padding: 14, textAlign: "center" }}>Registrá avances en la pestaña Avance</div>
@@ -1003,7 +1009,7 @@ function EjecTab({ stats, tasks, note, setNote }) {
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontSize: 11, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.name}</div>
                 <div style={{ fontSize: 9.5, color: "#aaa", display: "flex", gap: 3, alignItems: "center" }}>
-                  <Avatars ids={t.responsible} size={14} /><span>{t.hours}h{h > 0 && ` · ${h}h real`}</span>
+                  <Avatars ids={t.responsible} size={14} /><span>{formatHours(t.hours)}h{h > 0 && ` · ${formatHours(h)}h real`}</span>
                 </div>
               </div>
               <div style={{ width: 40, flexShrink: 0 }}><div style={{ height: 4, background: GT.warmGreyLight, borderRadius: 2, overflow: "hidden" }}><div style={{ width: `${t.progress}%`, height: "100%", background: pi.color }} /></div></div>
@@ -1021,7 +1027,7 @@ function EjecTab({ stats, tasks, note, setNote }) {
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontSize: 11, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.name}</div>
                 <div style={{ fontSize: 9.5, color: "#aaa", display: "flex", gap: 3, alignItems: "center" }}>
-                  <Avatars ids={t.responsible} size={13} /><span>{t.hours}h{h > 0 && ` · ${h}h real`} · {pi.name}</span>
+                  <Avatars ids={t.responsible} size={13} /><span>{formatHours(t.hours)}h{h > 0 && ` · ${formatHours(h)}h real`} · {pi.name}</span>
                 </div>
               </div>
             </div>
@@ -1032,7 +1038,7 @@ function EjecTab({ stats, tasks, note, setNote }) {
       {/* Team */}
       <div style={{ background: "white", borderRadius: 12, padding: 18, marginBottom: 18 }}>
         <h3 style={{ margin: "0 0 12px", fontSize: 14, fontWeight: 800, color: GT.purple }}>👥 Equipo</h3>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(195px,1fr))", gap: 10 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(min(195px,100%),1fr))", gap: 10 }}>
           {stats.ms.filter(m => m.tasks > 0).map(m => (
             <div key={m.id} style={{ padding: 12, borderRadius: 10, border: `1px solid ${GT.warmGreyLight}`, background: GT.warmGreyBg }}>
               <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 8 }}>
@@ -1048,7 +1054,7 @@ function EjecTab({ stats, tasks, note, setNote }) {
                 <div style={{ width: `${m.pct}%`, height: "100%", background: m.color, transition: "width .5s" }} />
               </div>
               <div style={{ fontSize: 9.5, color: "#aaa" }}>✅{m.done} · 🔵{m.inP} · ⬜{m.tasks - m.done - m.inP}</div>
-              {m.hL > 0 && <div style={{ fontSize: 10, color: m.color, fontWeight: 700, marginTop: 3, fontFamily: "'JetBrains Mono',monospace" }}>{m.hL}h reales</div>}
+              {m.hL > 0 && <div style={{ fontSize: 10, color: m.color, fontWeight: 700, marginTop: 3, fontFamily: "'JetBrains Mono',monospace" }}>{formatHours(m.hL)}h reales</div>}
             </div>
           ))}
         </div>
