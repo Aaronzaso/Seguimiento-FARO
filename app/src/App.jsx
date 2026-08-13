@@ -1,10 +1,38 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { GT, PHASES, TEAM, INITIAL_TASKS, gph, gtm, sumH, migrateTask, getDeadlineStats, PROJECT_DEADLINE } from "./constants";
 import { storageGet, storageSet } from "./storage";
-import { exportToExcel, importFromExcel, fetchPublishedData, saveCutToRemote } from "./excel";
+import {
+  exportToExcel,
+  importFromExcel,
+  fetchPublishedData,
+  fetchPublishedMeta,
+  saveCutToRemote,
+} from "./excel";
+import { getFaroSession, loginFaro, logoutFaro } from "./session";
 
 const SK = "faro-v6";
-const REMOTE_TOKEN_KEY = "faro_save_token";
+
+function tasksWithUpdates(tasks, updates = {}) {
+  return tasks.map(task => {
+    const update = updates[task.id];
+    if (!update) return task;
+    const merged = { ...task };
+    if (update.progress !== undefined) merged.progress = update.progress;
+    if (update.notes !== undefined) merged.notes = update.notes;
+    if (update.hoursBy) merged.hoursBy = { ...task.hoursBy, ...update.hoursBy };
+    if (update.responsible) merged.responsible = update.responsible;
+    return merged;
+  });
+}
+
+function draftSnapshot(tasks, note) {
+  return { tasks: tasks.map(migrateTask), note: String(note || "") };
+}
+
+function sameDraft(left, right) {
+  if (!left || !right) return false;
+  return JSON.stringify(left) === JSON.stringify(right);
+}
 
 function DragBar({ value, color, onChange, h = 8 }) {
   const ref = useRef(null);
@@ -16,16 +44,38 @@ function DragBar({ value, color, onChange, h = 8 }) {
     const x = Math.max(0, Math.min(cx - r.left, r.width));
     onChange(Math.max(0, Math.min(100, Math.round((x / r.width) * 20) * 5)));
   }, [onChange]);
-  useEffect(() => {
-    const mv = e => { if (dragging.current) calc(e.clientX); };
-    const up = () => { dragging.current = false; tick(t => t + 1); };
-    window.addEventListener("mousemove", mv);
-    window.addEventListener("mouseup", up);
-    return () => { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); };
-  }, [calc]);
+  const finishDrag = useCallback(event => {
+    dragging.current = false;
+    if (ref.current?.hasPointerCapture?.(event.pointerId)) {
+      ref.current.releasePointerCapture(event.pointerId);
+    }
+    tick(current => current + 1);
+  }, []);
+  const handleKeyDown = event => {
+    const next = {
+      ArrowLeft: value - 5,
+      ArrowDown: value - 5,
+      ArrowRight: value + 5,
+      ArrowUp: value + 5,
+      Home: 0,
+      End: 100,
+    }[event.key];
+    if (next === undefined) return;
+    event.preventDefault();
+    onChange(Math.max(0, Math.min(100, next)));
+  };
   return (
-    <div ref={ref} onMouseDown={e => { dragging.current = true; calc(e.clientX); }}
-      style={{ width: "100%", height: h, background: GT.warmGreyLight, borderRadius: h / 2, cursor: "ew-resize", flexShrink: 0 }}>
+    <div ref={ref} role="slider" tabIndex={0} aria-label="Avance" aria-valuemin={0} aria-valuemax={100} aria-valuenow={value}
+      onKeyDown={handleKeyDown}
+      onPointerDown={event => {
+        dragging.current = true;
+        ref.current?.setPointerCapture?.(event.pointerId);
+        calc(event.clientX);
+      }}
+      onPointerMove={event => { if (dragging.current) calc(event.clientX); }}
+      onPointerUp={finishDrag}
+      onPointerCancel={finishDrag}
+      style={{ width: "100%", height: Math.max(h, 14), background: GT.warmGreyLight, borderRadius: h / 2, cursor: "ew-resize", flexShrink: 0, touchAction: "none" }}>
       <div style={{ width: `${value}%`, height: "100%", background: color, borderRadius: h / 2, transition: dragging.current ? "none" : "width .2s" }} />
     </div>
   );
@@ -134,33 +184,49 @@ export default function App() {
   const [history, setHistory] = useState([]);
   const [importMsg, setImportMsg] = useState(null);
   const [published, setPublished] = useState(null);
+  const [baseVersion, setBaseVersion] = useState(null);
+  const [baseSnapshot, setBaseSnapshot] = useState(null);
+  const [remoteMeta, setRemoteMeta] = useState(null);
+  const [legacyDraft, setLegacyDraft] = useState(false);
+  const [conflict, setConflict] = useState(null);
+  const [session, setSession] = useState(null);
+  const [showLogin, setShowLogin] = useState(false);
   const [savingCut, setSavingCut] = useState(false);
   const fileRef = useRef(null);
   const isGitHubPages = window.location.hostname.endsWith("github.io");
 
   const applyUpdates = useCallback((updates) => {
-    setTasks(prev => prev.map(t => {
-      const u = updates[t.id];
-      if (!u) return t;
-      const merged = { ...t };
-      if (u.progress !== undefined) merged.progress = u.progress;
-      if (u.notes !== undefined) merged.notes = u.notes;
-      if (u.hoursBy) merged.hoursBy = { ...t.hoursBy, ...u.hoursBy };
-      if (u.responsible) merged.responsible = u.responsible;
-      return merged;
-    }));
+    setTasks(prev => tasksWithUpdates(prev, updates));
   }, []);
+
+  const currentSnapshot = useMemo(() => draftSnapshot(tasks, note), [tasks, note]);
+  const isDirty = useMemo(
+    () => legacyDraft || !sameDraft(currentSnapshot, baseSnapshot),
+    [baseSnapshot, currentSnapshot, legacyDraft],
+  );
 
   // Load
   useEffect(() => {
     let cancelled = false;
     (async () => {
       let hasLocal = false;
+      let localBaseVersion = null;
       try {
         const raw = await storageGet(SK);
         if (!cancelled && raw) {
           const d = JSON.parse(raw);
-          if (d.tasks && Array.isArray(d.tasks)) { setTasks(d.tasks.map(migrateTask)); hasLocal = true; }
+          if (d.tasks && Array.isArray(d.tasks)) {
+            setTasks(d.tasks.map(migrateTask));
+            hasLocal = true;
+            localBaseVersion = typeof d.baseVersion === "string" ? d.baseVersion : null;
+            setBaseVersion(localBaseVersion);
+            if (d.baseSnapshot?.tasks && Array.isArray(d.baseSnapshot.tasks)) {
+              setBaseSnapshot(draftSnapshot(d.baseSnapshot.tasks.map(migrateTask), d.baseSnapshot.note));
+            } else {
+              setLegacyDraft(true);
+            }
+            if (!localBaseVersion) setLegacyDraft(true);
+          }
           if (typeof d.note === "string") setNote(d.note);
           if (Array.isArray(d.history)) setHistory(d.history);
         }
@@ -168,29 +234,120 @@ export default function App() {
 
       // Published Excel (datos/ in the repo, copied next to the app on deploy)
       try {
-        const pub = await fetchPublishedData();
+        const pub = await fetchPublishedData({ allowStatic: isGitHubPages });
         if (!cancelled && pub) {
           setPublished(pub);
-          if (pub.history?.length) setHistory(pub.history);
-          if (!hasLocal) applyUpdates(pub.updates); // first visit: start from the team's published data
+          setRemoteMeta(pub);
+          if (!hasLocal) {
+            const publishedTasks = tasksWithUpdates(INITIAL_TASKS.map(migrateTask), pub.updates);
+            const publishedNote = pub.history?.at(-1)?.notes || "";
+            setTasks(publishedTasks);
+            setNote(publishedNote);
+            if (pub.history?.length) setHistory(pub.history);
+            setBaseVersion(pub.version);
+            setBaseSnapshot(draftSnapshot(publishedTasks, publishedNote));
+            setLegacyDraft(false);
+          } else if (localBaseVersion && localBaseVersion !== pub.version) {
+            setConflict({
+              code: "REMOTE_UPDATE",
+              message: "Hay una versión publicada más reciente que este borrador.",
+              ...pub,
+            });
+          }
         }
       } catch (err) { console.error("Published:", err); }
+
+      if (!isGitHubPages) {
+        try {
+          const auth = await getFaroSession();
+          if (!cancelled) setSession(auth.user || null);
+        } catch (err) { console.error("Session:", err); }
+      }
 
       if (!cancelled) setReady(true);
     })();
     return () => { cancelled = true; };
-  }, [applyUpdates]);
+  }, [isGitHubPages]);
 
   // Save (debounced)
   useEffect(() => {
     if (!ready) return;
-    const t = setTimeout(() => { storageSet(SK, JSON.stringify({ tasks, note, history })); }, 400);
+    const t = setTimeout(() => {
+      storageSet(SK, JSON.stringify({ tasks, note, history, baseVersion, baseSnapshot }));
+    }, 400);
     return () => clearTimeout(t);
-  }, [tasks, note, history, ready]);
+  }, [tasks, note, history, baseVersion, baseSnapshot, ready]);
 
   const updateTask = useCallback((id, updates) => {
     setTasks(prev => prev.map(t => t.id === id ? { ...t, ...updates } : t));
   }, []);
+
+  const loadLatestPublished = useCallback(async ({ confirmDiscard = true } = {}) => {
+    if (confirmDiscard && isDirty) {
+      const discard = window.confirm(
+        "Hay cambios guardados solo en este navegador. ¿Querés descartarlos y cargar la versión publicada? Podés exportar el Excel primero como respaldo.",
+      );
+      if (!discard) return false;
+    }
+
+    setImportMsg({ ok: true, text: "Cargando la última versión publicada…" });
+    const pub = await fetchPublishedData({ allowStatic: isGitHubPages });
+    if (!pub) throw new Error("No se pudo cargar la versión publicada.");
+    const publishedTasks = tasksWithUpdates(INITIAL_TASKS.map(migrateTask), pub.updates);
+    const publishedNote = pub.history?.at(-1)?.notes || "";
+    setTasks(publishedTasks);
+    setNote(publishedNote);
+    setHistory(pub.history || []);
+    setPublished(pub);
+    setRemoteMeta(pub);
+    setBaseVersion(pub.version);
+    setBaseSnapshot(draftSnapshot(publishedTasks, publishedNote));
+    setLegacyDraft(false);
+    setConflict(null);
+    setImportMsg({ ok: true, text: `Versión publicada cargada: ${pub.fileName}.` });
+    setTimeout(() => setImportMsg(null), 5000);
+    return true;
+  }, [isDirty, isGitHubPages]);
+
+  useEffect(() => {
+    if (!ready || isGitHubPages) return undefined;
+    let cancelled = false;
+    const check = async () => {
+      const meta = await fetchPublishedMeta();
+      if (!cancelled && meta?.version) setRemoteMeta(meta);
+    };
+    const interval = window.setInterval(check, 60000);
+    const onFocus = () => { check(); };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onFocus);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onFocus);
+    };
+  }, [ready, isGitHubPages]);
+
+  const handleLogin = async token => {
+    const auth = await loginFaro(token);
+    setSession(auth.user);
+    setShowLogin(false);
+    setImportMsg({ ok: true, text: `Sesión iniciada como ${auth.user.name}.` });
+    setTimeout(() => setImportMsg(null), 5000);
+    return auth.user;
+  };
+
+  const handleLogout = async () => {
+    try {
+      await logoutFaro();
+      setSession(null);
+      setImportMsg({ ok: true, text: "Sesión cerrada. El borrador local se conserva." });
+    } catch (error) {
+      console.error("Logout:", error);
+      setImportMsg({ ok: false, text: `No se pudo cerrar la sesión: ${error.message}` });
+    }
+    setTimeout(() => setImportMsg(null), 5000);
+  };
 
   const filtered = tasks.filter(t =>
     (fp === "all" || t.phase === fp) &&
@@ -241,30 +398,83 @@ export default function App() {
   };
 
   const handleSaveCut = async () => {
-    let token = sessionStorage.getItem(REMOTE_TOKEN_KEY) || "";
-    if (!token) {
-      token = window.prompt("Ingresá la clave para publicar el corte en GitHub:")?.trim() || "";
-      if (!token) return;
-      sessionStorage.setItem(REMOTE_TOKEN_KEY, token);
+    if (!session) {
+      setShowLogin(true);
+      return;
+    }
+    if (!baseVersion) {
+      setConflict({
+        code: "LEGACY_DRAFT",
+        message: "Este borrador fue creado antes del control de versiones. Exportalo como respaldo y cargá la versión publicada antes de guardar.",
+      });
+      return;
     }
 
     setSavingCut(true);
-    setImportMsg({ ok: true, text: "Publicando el Excel del corte en GitHub…" });
+    setImportMsg({ ok: true, text: "Validando tu sesión y la versión publicada…" });
     try {
-      const saved = await saveCutToRemote({ tasks, history, note, token });
+      const liveSession = await getFaroSession();
+      if (!liveSession.user) {
+        setSession(null);
+        setShowLogin(true);
+        setImportMsg({ ok: false, text: "La sesión venció. Iniciá sesión de nuevo; tu borrador se conserva." });
+        return;
+      }
+      if (liveSession.user.id !== session.id) {
+        setSession(liveSession.user);
+        setConflict({
+          code: "SESSION_CHANGED",
+          message: `La sesión activa cambió a ${liveSession.user.name}. Revisá la identidad antes de publicar este borrador.`,
+        });
+        setImportMsg({ ok: false, text: "No se publicó nada porque cambió la identidad de la sesión." });
+        return;
+      }
+      setImportMsg({ ok: true, text: "Publicando el Excel del corte en GitHub…" });
+      const saved = await saveCutToRemote({ tasks, history, note, baseVersion });
       if (saved.history?.length) setHistory(saved.history);
+      const savedSnapshot = draftSnapshot(tasks, note);
+      setBaseVersion(saved.version);
+      setBaseSnapshot(savedSnapshot);
+      setLegacyDraft(false);
+      setConflict(null);
       setPublished(prev => ({
         ...prev,
         history: saved.history || prev?.history || [],
         fileName: saved.fileName,
+        version: saved.version,
         lastModified: new Date(),
+        updatedBy: saved.updatedBy,
+        updatedById: saved.updatedById,
+        updatedAt: saved.savedAt,
       }));
+      setRemoteMeta({
+        version: saved.version,
+        fileName: saved.fileName,
+        updatedBy: saved.updatedBy,
+        updatedById: saved.updatedById,
+        updatedAt: saved.savedAt,
+      });
       setImportMsg({
         ok: true,
-        text: `Corte publicado: ${saved.fileName} · commit ${saved.commitSha.slice(0, 7)}.`,
+        text: `Corte publicado por ${saved.updatedBy}: ${saved.fileName} · commit ${saved.commitSha.slice(0, 7)}.`,
       });
     } catch (error) {
-      if (error.status === 401) sessionStorage.removeItem(REMOTE_TOKEN_KEY);
+      if (error.status === 401) {
+        setSession(null);
+        setShowLogin(true);
+      }
+      if (error.status === 409 || error.code === "VERSION_CONFLICT") {
+        setConflict({
+          code: "VERSION_CONFLICT",
+          message: error.message,
+          version: error.currentVersion,
+          fileName: error.currentFileName,
+          updatedBy: error.updatedBy,
+          updatedAt: error.updatedAt,
+        });
+        const meta = await fetchPublishedMeta();
+        if (meta) setRemoteMeta(meta);
+      }
       setImportMsg({ ok: false, text: error.message });
     } finally {
       setSavingCut(false);
@@ -321,8 +531,25 @@ export default function App() {
             ))}
           </div>
           <div style={{ display: "flex", gap: 6 }}>
+            {!isGitHubPages && (session ? (
+              <div style={{ display: "flex", alignItems: "center", gap: 7, padding: "4px 9px", borderRadius: 8, background: "rgba(255,255,255,.1)" }}>
+                <div style={{ width: 22, height: 22, borderRadius: "50%", background: GT.teal, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 800 }}>
+                  {session.name.split(/\s+/).map(part => part[0]).slice(0, 2).join("").toUpperCase()}
+                </div>
+                <div style={{ lineHeight: 1.1 }}>
+                  <div style={{ fontSize: 10.5, fontWeight: 700 }}>{session.name}</div>
+                  <div style={{ fontSize: 8.5, opacity: .55 }}>{session.role}</div>
+                </div>
+                <button onClick={handleLogout} title="Cerrar sesión" style={{ border: 0, background: "transparent", color: "rgba(255,255,255,.65)", cursor: "pointer", fontSize: 12 }}>×</button>
+              </div>
+            ) : (
+              <button onClick={() => setShowLogin(true)}
+                style={{ padding: "6px 12px", borderRadius: 8, border: "1px solid rgba(255,255,255,.35)", background: "rgba(255,255,255,.1)", color: "white", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                👤 Iniciar sesión
+              </button>
+            ))}
             <button onClick={handleSaveCut} disabled={savingCut || isGitHubPages}
-              title={isGitHubPages ? "La publicación automática está disponible en la versión Vercel." : "Crear o actualizar el Excel del corte de hoy"}
+              title={isGitHubPages ? "La publicación automática está disponible en la versión Vercel." : session ? "Crear o actualizar el Excel del corte de hoy" : "Iniciá sesión con tu clave personal para guardar"}
               style={{ padding: "6px 14px", borderRadius: 8, border: "1px solid rgba(255,255,255,.35)", background: savingCut || isGitHubPages ? "rgba(255,255,255,.08)" : GT.teal,
                 color: "white", fontSize: 11, fontWeight: 700, cursor: savingCut ? "wait" : isGitHubPages ? "not-allowed" : "pointer", opacity: savingCut || isGitHubPages ? .65 : 1 }}>
               {savingCut ? "⏳ Publicando…" : isGitHubPages ? "☁️ Disponible en Vercel" : "☁️ Guardar corte"}
@@ -342,6 +569,28 @@ export default function App() {
         </div>
       </div>
 
+      {(legacyDraft || conflict || (remoteMeta?.version && remoteMeta.version !== baseVersion)) && !isGitHubPages && (
+        <div role="alert" aria-live="assertive" style={{ padding: "11px 28px", background: conflict?.code === "VERSION_CONFLICT" ? GT.redBg : "#FFF8E8", borderBottom: `1px solid ${conflict?.code === "VERSION_CONFLICT" ? GT.red : GT.orange}35`, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 16 }}>{conflict?.code === "VERSION_CONFLICT" ? "🛑" : "⚠️"}</span>
+          <div style={{ flex: 1, minWidth: 220 }}>
+            <div style={{ fontSize: 12, fontWeight: 800, color: conflict?.code === "VERSION_CONFLICT" ? GT.red : "#9A5A00" }}>
+              {conflict?.message || `${remoteMeta?.updatedBy || "Otra persona"} publicó una versión nueva mientras editabas.`}
+            </div>
+            <div style={{ fontSize: 10, color: "#88745B", marginTop: 2 }}>
+              Tu borrador no fue modificado. Exportalo si necesitás conservarlo y luego cargá la versión oficial antes de publicar.
+            </div>
+          </div>
+          <button onClick={() => exportToExcel(tasks, history, note)}
+            style={{ padding: "5px 11px", borderRadius: 7, border: `1px solid ${GT.orange}70`, background: "white", color: "#9A5A00", fontSize: 10.5, fontWeight: 700, cursor: "pointer" }}>
+            📥 Exportar respaldo
+          </button>
+          <button onClick={() => loadLatestPublished().catch(error => setImportMsg({ ok: false, text: error.message }))}
+            style={{ padding: "5px 11px", borderRadius: 7, border: 0, background: GT.purple, color: "white", fontSize: 10.5, fontWeight: 700, cursor: "pointer" }}>
+            🔄 Cargar versión nueva
+          </button>
+        </div>
+      )}
+
       {/* Published data bar */}
       {published && (
         <div style={{ padding: "8px 28px", background: GT.purpleBg, borderBottom: `1px solid ${GT.purple}20`,
@@ -351,24 +600,22 @@ export default function App() {
             Datos publicados por el equipo
             {published.lastModified ? ` (${published.lastModified.toLocaleDateString("es-CR", { day: "2-digit", month: "short", year: "numeric" })})` : ""}
             {published.fileName ? ` · ${published.fileName}` : ""}
+            {published.updatedBy ? ` · por ${published.updatedBy}` : ""}
           </span>
-          <button onClick={() => {
-            applyUpdates(published.updates);
-            if (published.history?.length) setHistory(published.history);
-            setImportMsg({ ok: true, text: `Se cargaron los datos publicados (${Object.keys(published.updates).length} tareas).` });
-            setTimeout(() => setImportMsg(null), 5000);
-          }}
+          <button onClick={() => loadLatestPublished().catch(error => setImportMsg({ ok: false, text: error.message }))}
             style={{ padding: "4px 12px", borderRadius: 6, border: `1px solid ${GT.purple}40`, background: "white",
               color: GT.purple, fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
             🔄 Cargar
           </button>
-          <span style={{ fontSize: 10, color: "#999" }}>Carga el Excel más reciente publicado en GitHub. “Guardar corte” crea o actualiza el archivo del día.</span>
+          <span style={{ fontSize: 10, color: "#999" }}>
+            {isDirty ? "Tenés cambios en este navegador pendientes de publicar." : "Tu borrador coincide con la versión publicada."}
+          </span>
         </div>
       )}
 
       {/* Import message */}
       {importMsg && (
-        <div style={{ padding: "10px 28px", background: importMsg.ok ? GT.greenBg : GT.redBg,
+        <div role={importMsg.ok ? "status" : "alert"} aria-live={importMsg.ok ? "polite" : "assertive"} style={{ padding: "10px 28px", background: importMsg.ok ? GT.greenBg : GT.redBg,
           borderBottom: `1px solid ${importMsg.ok ? GT.greenDark : GT.red}40`, display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{ fontSize: 14 }}>{importMsg.ok ? "✅" : "❌"}</span>
           <span style={{ fontSize: 12, color: importMsg.ok ? GT.greenDark : GT.red, fontWeight: 600 }}>{importMsg.text}</span>
@@ -380,6 +627,63 @@ export default function App() {
       )}
       {tab === "ejecutivo" && <EjecTab stats={stats} tasks={tasks} note={note} setNote={setNote} />}
       {tab === "historico" && <HistoryTab history={history} />}
+      {showLogin && <LoginModal onClose={() => setShowLogin(false)} onLogin={handleLogin} />}
+    </div>
+  );
+}
+
+function LoginModal({ onClose, onLogin }) {
+  const [token, setToken] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    const onKeyDown = event => { if (event.key === "Escape" && !loading) onClose(); };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [loading, onClose]);
+
+  const submit = async event => {
+    event.preventDefault();
+    if (!token.trim()) return;
+    setLoading(true);
+    setError("");
+    try {
+      await onLogin(token.trim());
+    } catch (loginError) {
+      setError(loginError.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div role="dialog" aria-modal="true" aria-label="Iniciar sesión en FARO"
+      style={{ position: "fixed", inset: 0, zIndex: 1000, background: "rgba(25,18,35,.62)", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <form onSubmit={submit} style={{ width: "min(420px,100%)", background: "white", borderRadius: 16, padding: 24, boxShadow: "0 20px 70px rgba(0,0,0,.28)" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start" }}>
+          <div>
+            <div style={{ fontSize: 10, fontWeight: 800, color: GT.teal, letterSpacing: 1.5 }}>ACCESO DEL EQUIPO</div>
+            <h2 style={{ margin: "5px 0 4px", fontSize: 19, color: GT.purple }}>Iniciar sesión en FARO</h2>
+          </div>
+          <button type="button" onClick={onClose} aria-label="Cerrar" style={{ border: 0, background: GT.warmGreyBg, borderRadius: 7, width: 28, height: 28, cursor: "pointer", fontSize: 17 }}>×</button>
+        </div>
+        <p style={{ margin: "8px 0 16px", color: "#777", fontSize: 12, lineHeight: 1.5 }}>
+          Ingresá la clave personal que te compartió el administrador. FARO reconocerá automáticamente tu nombre y registrará cada publicación.
+        </p>
+        <label htmlFor="faro-personal-key" style={{ ...lbl, fontSize: 10 }}>Clave personal</label>
+        <input id="faro-personal-key" autoFocus type="password" autoComplete="current-password" value={token} onChange={event => setToken(event.target.value)}
+          placeholder="Pegá tu clave personal"
+          style={{ ...inp, marginTop: 6, minHeight: 42, fontFamily: "'JetBrains Mono',monospace" }} />
+        {error && <div role="alert" aria-live="assertive" style={{ marginTop: 9, padding: "8px 10px", borderRadius: 7, background: GT.redBg, color: GT.red, fontSize: 11, fontWeight: 700 }}>{error}</div>}
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
+          <button type="button" onClick={onClose} style={{ padding: "8px 14px", borderRadius: 8, border: `1px solid ${GT.warmGreyLight}`, background: "white", color: "#777", fontWeight: 700, cursor: "pointer" }}>Cancelar</button>
+          <button type="submit" disabled={loading || !token.trim()} style={{ padding: "8px 16px", borderRadius: 8, border: 0, background: GT.purple, color: "white", fontWeight: 800, cursor: loading ? "wait" : "pointer", opacity: loading || !token.trim() ? .55 : 1 }}>
+            {loading ? "Validando…" : "Entrar"}
+          </button>
+        </div>
+        <div style={{ marginTop: 14, fontSize: 9.5, color: "#aaa" }}>La sesión dura 8 horas y la clave se guarda en una cookie segura, no en el almacenamiento de la página.</div>
+      </form>
     </div>
   );
 }
@@ -602,6 +906,7 @@ function HistoryTab({ history }) {
                     {index === 0 && <span style={{ fontSize: 9, fontWeight: 700, color: GT.purple, background: GT.purpleBg, padding: "2px 7px", borderRadius: 4 }}>ÚLTIMO CORTE</span>}
                     {cut.branch && <span style={{ fontSize: 10, color: "#888" }}>Rama: <strong>{cut.branch}</strong></span>}
                     {cut.commit && <span style={{ fontSize: 10, color: "#888", fontFamily: "'JetBrains Mono',monospace" }}>Commit: {cut.commit}</span>}
+                    {cut.updatedBy && <span style={{ fontSize: 10, color: GT.teal }}>Actualizado por <strong>{cut.updatedBy}</strong></span>}
                   </div>
                 </div>
                 <div style={{ textAlign: "right" }}>
@@ -752,7 +1057,7 @@ function EjecTab({ stats, tasks, note, setNote }) {
       {/* Note */}
       <div style={{ background: "white", borderRadius: 12, padding: 18 }}>
         <h3 style={{ margin: "0 0 4px", fontSize: 14, fontWeight: 800, color: GT.purple }}>📝 Nota para el Socio</h3>
-        <p style={{ fontSize: 10, color: "#999", margin: "0 0 10px" }}>Se guarda automáticamente.</p>
+        <p style={{ fontSize: 10, color: "#999", margin: "0 0 10px" }}>El borrador se guarda en este navegador; usá “Guardar corte” para compartirlo con el equipo.</p>
         <textarea value={note} onChange={e => setNote(e.target.value)}
           placeholder={"Resumen de avance:\n\n• Logros:\n  -\n\n• Bloqueantes:\n  -\n\n• Próximos pasos:\n  -"}
           style={{ width: "100%", minHeight: 140, padding: 14, borderRadius: 10, border: `1px solid #E8E5E1`, fontSize: 13,

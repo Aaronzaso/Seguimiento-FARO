@@ -1,7 +1,13 @@
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { INITIAL_TASKS, PHASES, TEAM } from "../src/constants.js";
-import { createWorkbook, parseWorkbookHistory, workbookToArray } from "../src/excel.js";
+import {
+  createWorkbook,
+  parseWorkbookAudit,
+  parseWorkbookHistory,
+  workbookToArray,
+} from "../src/excel.js";
+import { assertTrustedOrigin, authenticateRequest, FaroAuthError } from "../lib/faro-auth.js";
 
 const DEFAULT_REPOSITORY = "Aaronzaso/Seguimiento-FARO";
 const DEFAULT_BRANCH = "main";
@@ -11,10 +17,22 @@ const TEAM_IDS = new Set(TEAM.map(member => member.id));
 const PHASE_NAMES = new Set(PHASES.map(phase => phase.name));
 const TASKS_BY_ID = new Map(INITIAL_TASKS.map(task => [task.id, task]));
 
-class HttpError extends Error {
-  constructor(status, message) {
+function serverDateKey() {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Costa_Rica",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+export class HttpError extends Error {
+  constructor(status, message, details = {}) {
     super(message);
     this.status = status;
+    Object.assign(this, details);
   }
 }
 
@@ -92,14 +110,17 @@ export function normalizeSavePayload(body) {
     tasks,
     history,
     note: text(body.note),
+    baseVersion: text(body.baseVersion, 300),
   };
 }
 
-function secretMatches(received, expected) {
-  if (!received || !expected) return false;
-  const receivedBuffer = Buffer.from(received);
-  const expectedBuffer = Buffer.from(expected);
-  return receivedBuffer.length === expectedBuffer.length && timingSafeEqual(receivedBuffer, expectedBuffer);
+function requireCurrentCutDate(date) {
+  const currentDate = serverDateKey();
+  if (date !== currentDate) {
+    throw new HttpError(400, `El corte debe guardarse con la fecha actual de Costa Rica (${currentDate}).`, {
+      code: "CUT_DATE_MISMATCH",
+    });
+  }
 }
 
 function githubConfig() {
@@ -131,11 +152,13 @@ async function githubRequest(config, path, options = {}) {
   if (response.status === 404 && options.allowNotFound) return null;
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const status = response.status === 409 || response.status === 422 ? 409 : 502;
+    const status = response.status === 409 ? 409 : 502;
     const message = status === 409
-      ? "El Excel cambió mientras se guardaba. Cargá la última versión e intentá de nuevo."
+      ? "Otra persona publicó cambios mientras se guardaba. Tu borrador se conservó."
       : `GitHub no pudo procesar el corte (${response.status}).`;
-    throw new HttpError(status, message);
+    throw new HttpError(status, message, {
+      code: status === 409 ? "VERSION_CONFLICT" : "GITHUB_REQUEST_FAILED",
+    });
   }
   return payload;
 }
@@ -163,29 +186,70 @@ function workbookBytes(file) {
   return new Uint8Array(Buffer.from(file.content.replace(/\s/g, ""), "base64"));
 }
 
-async function serveLatestCut(res) {
+function fileVersion(file) {
+  if (!file?.sha) return null;
+  return `${file.path || file.name || "datos/FARO_Cronograma.xlsx"}:${file.sha}`;
+}
+
+function latestAuditMetadata(file) {
+  const data = workbookBytes(file);
+  const event = data ? parseWorkbookAudit(data).at(-1) : null;
+  return {
+    updatedBy: event?.userName || "",
+    updatedById: event?.userId || "",
+    updatedAt: event?.savedAt || "",
+  };
+}
+
+function metaRequested(req) {
+  if (String(req.query?.meta || "") === "1") return true;
+  try {
+    return new URL(req.url || "/", "https://faro.local").searchParams.get("meta") === "1";
+  } catch {
+    return false;
+  }
+}
+
+function setCutHeaders(res, file, metadata) {
+  const version = fileVersion(file);
+  res.setHeader("Cache-Control", "private, no-store, max-age=0");
+  res.setHeader("X-Cut-File", file.name);
+  if (version) res.setHeader("X-Faro-Version", version);
+  if (file.sha) res.setHeader("ETag", `"${file.sha}"`);
+  if (metadata.updatedBy) res.setHeader("X-Faro-Updated-By", encodeURIComponent(metadata.updatedBy));
+  if (metadata.updatedById) res.setHeader("X-Faro-Updated-By-Id", encodeURIComponent(metadata.updatedById));
+  if (metadata.updatedAt) res.setHeader("X-Faro-Updated-At", metadata.updatedAt);
+}
+
+async function serveLatestCut(req, res) {
   const config = githubConfig();
   const workbooks = await listWorkbooks(config);
   const latest = workbooks.at(-1);
   if (!latest) throw new HttpError(404, "Todavía no hay cortes publicados.");
   const file = await getWorkbook(config, latest.path);
+  const metadata = latestAuditMetadata(file);
+  setCutHeaders(res, file, metadata);
+
+  if (metaRequested(req)) {
+    return res.status(200).json({
+      version: fileVersion(file),
+      fileName: file.name,
+      ...metadata,
+    });
+  }
+
   const bytes = Buffer.from(file.content.replace(/\s/g, ""), "base64");
 
   res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   res.setHeader("Content-Disposition", `inline; filename="${latest.name}"`);
-  res.setHeader("Cache-Control", "private, no-store, max-age=0");
-  res.setHeader("X-Cut-File", latest.name);
-  res.setHeader("ETag", `"${file.sha}"`);
   return res.status(200).send(bytes);
 }
 
 async function saveCut(req, res) {
-  const expectedSecret = process.env.FARO_SAVE_TOKEN;
-  if (!expectedSecret) throw new HttpError(503, "Falta configurar FARO_SAVE_TOKEN en Vercel.");
-  const receivedSecret = req.headers.authorization?.replace(/^Bearer\s+/i, "");
-  if (!secretMatches(receivedSecret, expectedSecret)) throw new HttpError(401, "La clave de guardado no es válida.");
-
+  assertTrustedOrigin(req);
+  const actor = authenticateRequest(req);
   const input = normalizeSavePayload(req.body);
+  requireCurrentCutDate(input.date);
   const config = githubConfig();
   const targetPath = `datos/FARO_Cronograma_${input.date}.xlsx`;
   const [workbooks, existingTarget] = await Promise.all([
@@ -195,19 +259,53 @@ async function saveCut(req, res) {
   const templateFile = existingTarget || (workbooks.at(-1)
     ? await getWorkbook(config, workbooks.at(-1).path)
     : null);
+  const currentVersion = fileVersion(templateFile);
+  if (currentVersion && input.baseVersion !== currentVersion) {
+    const metadata = latestAuditMetadata(templateFile);
+    throw new HttpError(409, "Otra persona publicó una versión más reciente. Tu borrador se conservó.", {
+      code: "VERSION_CONFLICT",
+      currentVersion,
+      currentFileName: templateFile.name,
+      ...metadata,
+    });
+  }
+
   const templateData = workbookBytes(templateFile);
   const officialHistory = templateData ? parseWorkbookHistory(templateData) : [];
-  const baseHistory = officialHistory.length > 0 ? officialHistory : input.history;
+  if (templateData && officialHistory.length === 0) {
+    throw new HttpError(
+      422,
+      "El Excel oficial no contiene un histórico válido. Se bloqueó el guardado para conservar los cortes anteriores.",
+      { code: "HISTORY_INVALID" },
+    );
+  }
+  const baseHistory = officialHistory;
+  const operationId = randomUUID();
+  const savedAt = new Date().toISOString();
+  const fileName = targetPath.split("/").at(-1);
 
   const { workbook, history } = createWorkbook(input.tasks, baseHistory, input.note, {
     date: input.date,
     branch: config.branch,
-    commit: "Vercel auto",
+    commit: `op:${operationId.slice(0, 8)}`,
     baseWorkbookData: templateData,
+    actor,
+    savedAt,
+    auditEvent: {
+      operationId,
+      savedAt,
+      cutDate: input.date,
+      userId: actor.id,
+      userName: actor.name,
+      role: actor.role,
+      action: existingTarget ? "Actualizar corte" : "Crear corte",
+      fileName,
+      baseVersion: currentVersion || "",
+    },
   });
   const bytes = Buffer.from(new Uint8Array(workbookToArray(workbook)));
   const commitBody = {
-    message: `Actualizar corte FARO ${input.date}`,
+    message: `Actualizar corte FARO ${input.date} · ${actor.name} · ${operationId.slice(0, 8)}`,
     content: bytes.toString("base64"),
     branch: config.branch,
   };
@@ -227,22 +325,35 @@ async function saveCut(req, res) {
 
   return res.status(existingTarget ? 200 : 201).json({
     ok: true,
-    fileName: targetPath.split("/").at(-1),
+    fileName,
+    version: saved.content?.sha ? `${targetPath}:${saved.content.sha}` : null,
     commitSha: saved.commit.sha,
     commitUrl: saved.commit.html_url,
     history,
+    operationId,
+    savedAt,
+    updatedBy: actor.name,
+    updatedById: actor.id,
   });
 }
 
 export default async function handler(req, res) {
   try {
-    if (req.method === "GET") return await serveLatestCut(res);
+    if (req.method === "GET") return await serveLatestCut(req, res);
     if (req.method === "POST") return await saveCut(req, res);
     res.setHeader("Allow", "GET, POST");
     return res.status(405).json({ error: "Método no permitido." });
   } catch (error) {
-    const status = error instanceof HttpError ? error.status : 500;
+    const status = error instanceof HttpError || error instanceof FaroAuthError ? error.status : 500;
     if (status >= 500) console.error("cuts-api", error);
-    return res.status(status).json({ error: error.message || "Error inesperado guardando el corte." });
+    return res.status(status).json({
+      error: error.message || "Error inesperado guardando el corte.",
+      code: error.code,
+      currentVersion: error.currentVersion,
+      currentFileName: error.currentFileName,
+      updatedBy: error.updatedBy,
+      updatedById: error.updatedById,
+      updatedAt: error.updatedAt,
+    });
   }
 }

@@ -2,6 +2,7 @@ import * as XLSX from "xlsx";
 import { TEAM, PHASES, sumH, gtm } from "./constants.js";
 
 const HISTORY_SHEET_NAMES = ["histórico avance", "historico avance", "histórico", "historico"];
+const AUDIT_SHEET_NAMES = ["auditoría", "auditoria", "bitácora", "bitacora"];
 const HISTORY_PHASE_COLUMNS = [
   { phase: "Levantamiento", header: "Levantamiento" },
   { phase: "Diseño", header: "Diseño" },
@@ -90,6 +91,9 @@ export function buildHistoryCut(tasks, previousHistory = [], note = "", options 
     branch: options.branch ?? previous?.branch ?? "Seguimiento-FARO",
     commit: options.commit ?? previous?.commit ?? "",
     notes: note.trim() || previous?.notes || "Corte exportado desde el tablero de seguimiento.",
+    updatedBy: options.actor?.name ?? previous?.updatedBy ?? "",
+    updatedById: options.actor?.id ?? previous?.updatedById ?? "",
+    updatedAt: options.savedAt ?? previous?.updatedAt ?? "",
   };
 }
 
@@ -146,11 +150,23 @@ export function createWorkbook(tasks, history = [], note = "", options = {}) {
   const wb = options.baseWorkbookData
     ? XLSX.read(options.baseWorkbookData, { type: "array", cellStyles: true })
     : XLSX.utils.book_new();
-  const upsertSheet = (name, sheet) => {
-    if (!wb.SheetNames.includes(name)) wb.SheetNames.push(name);
+  const upsertSheet = (name, sheet, matches = candidate => candidate === name) => {
+    const existingNames = wb.SheetNames.filter(matches);
+    const insertionIndex = existingNames.length > 0
+      ? wb.SheetNames.indexOf(existingNames[0])
+      : wb.SheetNames.length;
+    for (const existingName of existingNames) {
+      delete wb.Sheets[existingName];
+      wb.SheetNames = wb.SheetNames.filter(candidate => candidate !== existingName);
+    }
+    wb.SheetNames.splice(insertionIndex, 0, name);
     wb.Sheets[name] = sheet;
   };
-  upsertSheet("Cronograma", ws);
+  upsertSheet(
+    "Cronograma",
+    ws,
+    candidate => candidate.toLowerCase().includes("cronograma") || candidate.toLowerCase().includes("crono"),
+  );
 
   // Summary sheet
   const summaryRows = PHASES.map(p => {
@@ -204,6 +220,9 @@ export function createWorkbook(tasks, history = [], note = "", options = {}) {
     row["Rama revisada"] = cut.branch || "";
     row["Commit"] = cut.commit || "";
     row["Notas / evidencia"] = cut.notes || "";
+    row["Actualizado por"] = cut.updatedBy || "";
+    row["Actualizado por ID"] = cut.updatedById || "";
+    row["Actualizado en UTC"] = cut.updatedAt || "";
     return row;
   });
 
@@ -211,6 +230,7 @@ export function createWorkbook(tasks, history = [], note = "", options = {}) {
   ws4["!cols"] = [
     { wch: 16 }, { wch: 15 }, { wch: 15 }, { wch: 12 }, { wch: 13 }, { wch: 11 },
     { wch: 22 }, { wch: 20 }, { wch: 28 }, { wch: 14 }, { wch: 62 },
+    { wch: 24 }, { wch: 20 }, { wch: 25 },
   ];
   if (historyRows.length > 0) {
     for (let row = 2; row <= historyRows.length + 1; row += 1) {
@@ -220,9 +240,42 @@ export function createWorkbook(tasks, history = [], note = "", options = {}) {
       }
     }
   }
-  upsertSheet("Histórico avance", ws4);
+  upsertSheet(
+    "Histórico avance",
+    ws4,
+    candidate => HISTORY_SHEET_NAMES.includes(candidate.toLowerCase()),
+  );
 
-  return { workbook: wb, history: completeHistory };
+  // Append-only audit log. Unlike the daily history row, this keeps every save.
+  const previousAudit = options.baseWorkbookData ? parseWorkbookAudit(options.baseWorkbookData) : [];
+  const completeAudit = options.auditEvent
+    ? [...previousAudit, { ...options.auditEvent }]
+    : previousAudit;
+  if (completeAudit.length > 0) {
+    const auditRows = completeAudit.map(event => ({
+      "ID de operación": event.operationId || "",
+      "Fecha y hora UTC": event.savedAt || "",
+      "Fecha del corte": event.cutDate || "",
+      "Usuario ID": event.userId || "",
+      Usuario: event.userName || "",
+      Rol: event.role || "",
+      Acción: event.action || "Guardar corte",
+      Archivo: event.fileName || "",
+      "Versión base": event.baseVersion || "",
+    }));
+    const auditSheet = XLSX.utils.json_to_sheet(auditRows);
+    auditSheet["!cols"] = [
+      { wch: 38 }, { wch: 25 }, { wch: 16 }, { wch: 20 }, { wch: 26 },
+      { wch: 20 }, { wch: 18 }, { wch: 42 }, { wch: 72 },
+    ];
+    upsertSheet(
+      "Auditoría",
+      auditSheet,
+      candidate => AUDIT_SHEET_NAMES.includes(candidate.toLowerCase()),
+    );
+  }
+
+  return { workbook: wb, history: completeHistory, audit: completeAudit };
 }
 
 export function workbookToArray(workbook) {
@@ -248,7 +301,9 @@ export function parseWorkbookUpdates(arrayBuffer) {
   ) || wb.SheetNames[0];
 
   const ws = wb.Sheets[sheetName];
-  const rows = XLSX.utils.sheet_to_json(ws);
+  // Preserve blank cells from managed columns. An empty responsible/notes cell
+  // is an intentional value and must not fall back to INITIAL_TASKS on reload.
+  const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
 
   if (!rows || rows.length === 0) {
     throw new Error("El archivo está vacío o no tiene datos válidos.");
@@ -285,7 +340,7 @@ export function parseWorkbookUpdates(arrayBuffer) {
     }
 
     // Notes
-    const notes = row["Notas"] || row["notas"] || row["Comentarios"];
+    const notes = row["Notas"] ?? row["notas"] ?? row["Comentarios"];
     if (notes !== undefined && notes !== null) {
       update.notes = String(notes);
     }
@@ -307,11 +362,12 @@ export function parseWorkbookUpdates(arrayBuffer) {
     if (hasHours) update.hoursBy = hoursBy;
 
     // Responsible (from comma-separated names)
-    const respStr = row["Responsables"] || row["responsables"];
-    if (respStr && typeof respStr === "string") {
-      const names = respStr.split(",").map(s => s.trim().toLowerCase());
+    const hasResponsibleColumn = Object.hasOwn(row, "Responsables") || Object.hasOwn(row, "responsables");
+    const respStr = row["Responsables"] ?? row["responsables"];
+    if (hasResponsibleColumn && typeof respStr === "string") {
+      const names = respStr.split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
       const ids = names.map(n => teamNameToId[n]).filter(Boolean);
-      if (ids.length > 0) update.responsible = ids;
+      update.responsible = ids;
     }
 
     if (Object.keys(update).length > 0) {
@@ -349,8 +405,31 @@ export function parseWorkbookHistory(arrayBuffer) {
       branch: String(row["Rama revisada"] ?? row["Rama"] ?? "").trim(),
       commit: String(row["Commit"] ?? "").trim(),
       notes: String(row["Notas / evidencia"] ?? row["Notas"] ?? row["Evidencia"] ?? "").trim(),
+      updatedBy: String(row["Actualizado por"] ?? "").trim(),
+      updatedById: String(row["Actualizado por ID"] ?? "").trim(),
+      updatedAt: String(row["Actualizado en UTC"] ?? "").trim(),
     };
   }).filter(Boolean).sort((a, b) => a.date.localeCompare(b.date));
+}
+
+export function parseWorkbookAudit(arrayBuffer) {
+  const data = new Uint8Array(arrayBuffer);
+  const wb = XLSX.read(data, { type: "array" });
+  const sheetName = wb.SheetNames.find(name => AUDIT_SHEET_NAMES.includes(name.toLowerCase()));
+  if (!sheetName) return [];
+
+  const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { defval: "", raw: false });
+  return rows.map(row => ({
+    operationId: String(row["ID de operación"] ?? "").trim(),
+    savedAt: String(row["Fecha y hora UTC"] ?? "").trim(),
+    cutDate: dateKey(row["Fecha del corte"]) || String(row["Fecha del corte"] ?? "").trim(),
+    userId: String(row["Usuario ID"] ?? "").trim(),
+    userName: String(row["Usuario"] ?? "").trim(),
+    role: String(row["Rol"] ?? "").trim(),
+    action: String(row["Acción"] ?? "").trim(),
+    fileName: String(row["Archivo"] ?? "").trim(),
+    baseVersion: String(row["Versión base"] ?? "").trim(),
+  })).filter(event => event.operationId || event.savedAt || event.userName);
 }
 
 export function importFromExcel(file) {
@@ -376,8 +455,11 @@ export function importFromExcel(file) {
 // ═══ PUBLISHED DATA ═══
 // Vercel serves the latest workbook through /api/cuts. GitHub Pages keeps the
 // static datos/ fallback so both deployments can read the same published data.
-export async function fetchPublishedData() {
-  for (const url of ["/api/cuts", "./datos/FARO_Cronograma.xlsx"]) {
+export async function fetchPublishedData({ allowStatic = true } = {}) {
+  const sources = allowStatic
+    ? ["/api/cuts", "./datos/FARO_Cronograma.xlsx"]
+    : ["/api/cuts"];
+  for (const url of sources) {
     try {
       const res = await fetch(url, { cache: "no-store" });
       if (!res.ok) continue;
@@ -390,6 +472,10 @@ export async function fetchPublishedData() {
         history,
         lastModified: lm ? new Date(lm) : null,
         fileName: res.headers.get("X-Cut-File") || "FARO_Cronograma.xlsx",
+        version: res.headers.get("X-Faro-Version") || res.headers.get("ETag")?.replace(/^\"|\"$/g, "") || null,
+        updatedBy: decodeHeader(res.headers.get("X-Faro-Updated-By")),
+        updatedById: decodeHeader(res.headers.get("X-Faro-Updated-By-Id")),
+        updatedAt: res.headers.get("X-Faro-Updated-At") || null,
         source: url === "/api/cuts" ? "vercel" : "static",
       };
     } catch {
@@ -399,20 +485,44 @@ export async function fetchPublishedData() {
   return null;
 }
 
-export async function saveCutToRemote({ tasks, history, note, token, date = todayKey() }) {
+function decodeHeader(value) {
+  if (!value) return "";
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+export async function fetchPublishedMeta() {
+  try {
+    const response = await fetch("/api/cuts?meta=1", { cache: "no-store", credentials: "same-origin" });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function saveCutToRemote({ tasks, history, note, baseVersion, date = todayKey() }) {
   const res = await fetch("/api/cuts", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({ tasks, history, note, date }),
+    credentials: "same-origin",
+    body: JSON.stringify({ tasks, history, note, date, baseVersion }),
   });
 
   const payload = await res.json().catch(() => ({}));
   if (!res.ok) {
     const error = new Error(payload.error || "No se pudo guardar el corte en GitHub.");
     error.status = res.status;
+    error.code = payload.code;
+    error.currentVersion = payload.currentVersion;
+    error.currentFileName = payload.currentFileName;
+    error.updatedBy = payload.updatedBy;
+    error.updatedAt = payload.updatedAt;
     throw error;
   }
   return payload;

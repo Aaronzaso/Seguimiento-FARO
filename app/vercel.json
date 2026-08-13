@@ -6,6 +6,9 @@
   "functions": {
     "api/cuts.js": {
       "maxDuration": 60
+    },
+    "api/session.js": {
+      "maxDuration": 10
     }
   }
 }
