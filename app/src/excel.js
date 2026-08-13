@@ -13,7 +13,7 @@ const HISTORY_PHASE_COLUMNS = [
 
 const round1 = value => Math.round(value * 10) / 10;
 
-function todayKey() {
+export function todayKey() {
   const now = new Date();
   const year = now.getFullYear();
   const month = String(now.getMonth() + 1).padStart(2, "0");
@@ -78,8 +78,8 @@ function calculateProgress(tasks) {
   };
 }
 
-export function buildHistoryCut(tasks, previousHistory = [], note = "") {
-  const date = todayKey();
+export function buildHistoryCut(tasks, previousHistory = [], note = "", options = {}) {
+  const date = options.date || todayKey();
   const progress = calculateProgress(tasks);
   const previous = previousHistory.find(cut => cut.date === date);
 
@@ -87,21 +87,21 @@ export function buildHistoryCut(tasks, previousHistory = [], note = "") {
     date,
     global: progress.global,
     phases: progress.phases,
-    branch: previous?.branch || "Seguimiento-FARO",
-    commit: previous?.commit || "",
+    branch: options.branch ?? previous?.branch ?? "Seguimiento-FARO",
+    commit: options.commit ?? previous?.commit ?? "",
     notes: note.trim() || previous?.notes || "Corte exportado desde el tablero de seguimiento.",
   };
 }
 
-function withCurrentCut(tasks, history, note) {
+export function withCurrentCut(tasks, history, note, options = {}) {
   const normalized = Array.isArray(history) ? history.filter(cut => cut?.date) : [];
-  const current = buildHistoryCut(tasks, normalized, note);
+  const current = buildHistoryCut(tasks, normalized, note, options);
   return [...normalized.filter(cut => cut.date !== current.date), current]
     .sort((a, b) => a.date.localeCompare(b.date));
 }
 
 // ═══ EXPORT ═══
-export function exportToExcel(tasks, history = [], note = "") {
+export function createWorkbook(tasks, history = [], note = "", options = {}) {
   const rows = tasks.map(t => {
     const respNames = t.responsible.map(id => gtm(id).name).join(", ");
     const tHL = sumH(t.hoursBy);
@@ -143,8 +143,14 @@ export function exportToExcel(tasks, history = [], note = "") {
     { wch: 40 },  // Notas
   ];
 
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, "Cronograma");
+  const wb = options.baseWorkbookData
+    ? XLSX.read(options.baseWorkbookData, { type: "array", cellStyles: true })
+    : XLSX.utils.book_new();
+  const upsertSheet = (name, sheet) => {
+    if (!wb.SheetNames.includes(name)) wb.SheetNames.push(name);
+    wb.Sheets[name] = sheet;
+  };
+  upsertSheet("Cronograma", ws);
 
   // Summary sheet
   const summaryRows = PHASES.map(p => {
@@ -164,12 +170,12 @@ export function exportToExcel(tasks, history = [], note = "") {
 
   const ws2 = XLSX.utils.json_to_sheet(summaryRows);
   ws2["!cols"] = [{ wch: 24 }, { wch: 8 }, { wch: 12 }, { wch: 11 }, { wch: 13 }, { wch: 10 }];
-  XLSX.utils.book_append_sheet(wb, ws2, "Resumen");
+  upsertSheet("Resumen", ws2);
 
   // Team sheet
   const teamRows = TEAM.map(m => {
     const mt = tasks.filter(t => t.responsible.includes(m.id));
-    const mHL = mt.reduce((s, t) => s + (parseFloat(t.hoursBy?.[m.id]) || 0), 0);
+    const mHL = tasks.reduce((s, t) => s + (parseFloat(t.hoursBy?.[m.id]) || 0), 0);
     return {
       Nombre: m.name,
       Rol: m.role,
@@ -181,10 +187,11 @@ export function exportToExcel(tasks, history = [], note = "") {
 
   const ws3 = XLSX.utils.json_to_sheet(teamRows);
   ws3["!cols"] = [{ wch: 20 }, { wch: 6 }, { wch: 12 }, { wch: 16 }, { wch: 13 }];
-  XLSX.utils.book_append_sheet(wb, ws3, "Equipo");
+  upsertSheet("Equipo", ws3);
 
   // History sheet: one row per review date. Exporting again on the same day updates that day's cut.
-  const historyRows = withCurrentCut(tasks, history, note).map(cut => {
+  const completeHistory = withCurrentCut(tasks, history, note, options);
+  const historyRows = completeHistory.map(cut => {
     const row = {
       "Fecha del corte": new Date(`${cut.date}T12:00:00`),
       "Avance general": cut.global / 100,
@@ -213,9 +220,19 @@ export function exportToExcel(tasks, history = [], note = "") {
       }
     }
   }
-  XLSX.utils.book_append_sheet(wb, ws4, "Histórico avance");
+  upsertSheet("Histórico avance", ws4);
 
-  XLSX.writeFile(wb, `FARO_Cronograma_${todayKey()}.xlsx`);
+  return { workbook: wb, history: completeHistory };
+}
+
+export function workbookToArray(workbook) {
+  return XLSX.write(workbook, { type: "array", bookType: "xlsx", cellStyles: true });
+}
+
+export function exportToExcel(tasks, history = [], note = "") {
+  const date = todayKey();
+  const { workbook } = createWorkbook(tasks, history, note, { date });
+  XLSX.writeFile(workbook, `FARO_Cronograma_${date}.xlsx`);
 }
 
 // ═══ IMPORT ═══
@@ -357,18 +374,46 @@ export function importFromExcel(file) {
 }
 
 // ═══ PUBLISHED DATA ═══
-// The deploy workflow publishes the latest Excel from datos/ as datos/FARO_Cronograma.xlsx
-// next to the app. Returns { updates, history, lastModified } or null if there is no published file.
+// Vercel serves the latest workbook through /api/cuts. GitHub Pages keeps the
+// static datos/ fallback so both deployments can read the same published data.
 export async function fetchPublishedData() {
-  try {
-    const res = await fetch("./datos/FARO_Cronograma.xlsx", { cache: "no-store" });
-    if (!res.ok) return null;
-    const buf = await res.arrayBuffer();
-    const updates = parseWorkbookUpdates(buf);
-    const history = parseWorkbookHistory(buf);
-    const lm = res.headers.get("Last-Modified");
-    return { updates, history, lastModified: lm ? new Date(lm) : null };
-  } catch {
-    return null;
+  for (const url of ["/api/cuts", "./datos/FARO_Cronograma.xlsx"]) {
+    try {
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) continue;
+      const buf = await res.arrayBuffer();
+      const updates = parseWorkbookUpdates(buf);
+      const history = parseWorkbookHistory(buf);
+      const lm = res.headers.get("Last-Modified");
+      return {
+        updates,
+        history,
+        lastModified: lm ? new Date(lm) : null,
+        fileName: res.headers.get("X-Cut-File") || "FARO_Cronograma.xlsx",
+        source: url === "/api/cuts" ? "vercel" : "static",
+      };
+    } catch {
+      // Try the next source.
+    }
   }
+  return null;
+}
+
+export async function saveCutToRemote({ tasks, history, note, token, date = todayKey() }) {
+  const res = await fetch("/api/cuts", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ tasks, history, note, date }),
+  });
+
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const error = new Error(payload.error || "No se pudo guardar el corte en GitHub.");
+    error.status = res.status;
+    throw error;
+  }
+  return payload;
 }

@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { GT, PHASES, TEAM, INITIAL_TASKS, gph, gtm, sumH, migrateTask, getDeadlineStats, PROJECT_DEADLINE } from "./constants";
 import { storageGet, storageSet } from "./storage";
-import { exportToExcel, importFromExcel, fetchPublishedData } from "./excel";
+import { exportToExcel, importFromExcel, fetchPublishedData, saveCutToRemote } from "./excel";
 
 const SK = "faro-v6";
+const REMOTE_TOKEN_KEY = "faro_save_token";
 
 function DragBar({ value, color, onChange, h = 8 }) {
   const ref = useRef(null);
@@ -133,7 +134,9 @@ export default function App() {
   const [history, setHistory] = useState([]);
   const [importMsg, setImportMsg] = useState(null);
   const [published, setPublished] = useState(null);
+  const [savingCut, setSavingCut] = useState(false);
   const fileRef = useRef(null);
+  const isGitHubPages = window.location.hostname.endsWith("github.io");
 
   const applyUpdates = useCallback((updates) => {
     setTasks(prev => prev.map(t => {
@@ -237,6 +240,38 @@ export default function App() {
     setTimeout(() => setImportMsg(null), 5000);
   };
 
+  const handleSaveCut = async () => {
+    let token = sessionStorage.getItem(REMOTE_TOKEN_KEY) || "";
+    if (!token) {
+      token = window.prompt("Ingresá la clave para publicar el corte en GitHub:")?.trim() || "";
+      if (!token) return;
+      sessionStorage.setItem(REMOTE_TOKEN_KEY, token);
+    }
+
+    setSavingCut(true);
+    setImportMsg({ ok: true, text: "Publicando el Excel del corte en GitHub…" });
+    try {
+      const saved = await saveCutToRemote({ tasks, history, note, token });
+      if (saved.history?.length) setHistory(saved.history);
+      setPublished(prev => ({
+        ...prev,
+        history: saved.history || prev?.history || [],
+        fileName: saved.fileName,
+        lastModified: new Date(),
+      }));
+      setImportMsg({
+        ok: true,
+        text: `Corte publicado: ${saved.fileName} · commit ${saved.commitSha.slice(0, 7)}.`,
+      });
+    } catch (error) {
+      if (error.status === 401) sessionStorage.removeItem(REMOTE_TOKEN_KEY);
+      setImportMsg({ ok: false, text: error.message });
+    } finally {
+      setSavingCut(false);
+      setTimeout(() => setImportMsg(null), 8000);
+    }
+  };
+
   const dl = getDeadlineStats();
 
   return (
@@ -286,6 +321,12 @@ export default function App() {
             ))}
           </div>
           <div style={{ display: "flex", gap: 6 }}>
+            <button onClick={handleSaveCut} disabled={savingCut || isGitHubPages}
+              title={isGitHubPages ? "La publicación automática está disponible en la versión Vercel." : "Crear o actualizar el Excel del corte de hoy"}
+              style={{ padding: "6px 14px", borderRadius: 8, border: "1px solid rgba(255,255,255,.35)", background: savingCut || isGitHubPages ? "rgba(255,255,255,.08)" : GT.teal,
+                color: "white", fontSize: 11, fontWeight: 700, cursor: savingCut ? "wait" : isGitHubPages ? "not-allowed" : "pointer", opacity: savingCut || isGitHubPages ? .65 : 1 }}>
+              {savingCut ? "⏳ Publicando…" : isGitHubPages ? "☁️ Disponible en Vercel" : "☁️ Guardar corte"}
+            </button>
             <button onClick={() => exportToExcel(tasks, history, note)}
               style={{ padding: "6px 14px", borderRadius: 8, border: "1px solid rgba(255,255,255,.2)", background: "rgba(255,255,255,.08)",
                 color: "rgba(255,255,255,.8)", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
@@ -309,6 +350,7 @@ export default function App() {
           <span style={{ fontSize: 12, color: GT.purple, fontWeight: 600 }}>
             Datos publicados por el equipo
             {published.lastModified ? ` (${published.lastModified.toLocaleDateString("es-CR", { day: "2-digit", month: "short", year: "numeric" })})` : ""}
+            {published.fileName ? ` · ${published.fileName}` : ""}
           </span>
           <button onClick={() => {
             applyUpdates(published.updates);
@@ -320,7 +362,7 @@ export default function App() {
               color: GT.purple, fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
             🔄 Cargar
           </button>
-          <span style={{ fontSize: 10, color: "#999" }}>Reemplaza tu avance local con el Excel más reciente de la carpeta datos/ del repo.</span>
+          <span style={{ fontSize: 10, color: "#999" }}>Carga el Excel más reciente publicado en GitHub. “Guardar corte” crea o actualiza el archivo del día.</span>
         </div>
       )}
 

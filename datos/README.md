@@ -4,6 +4,10 @@ Aquí se guardan los Excel exportados desde la app. El archivo **más reciente**
 
 ## Cómo actualizar el avance del equipo
 
+En la versión Vercel, registrá el avance y presioná **☁️ Guardar corte**. La Function crea o actualiza este archivo y genera el commit automáticamente.
+
+El flujo manual continúa disponible como respaldo:
+
 1. Abrí la app publicada y registrá tu avance y horas.
 2. Presioná **📥 Exportar Excel** — se descarga `FARO_Cronograma_AAAA-MM-DD.xlsx`.
 3. Subí ese archivo a esta carpeta: en GitHub, entrá a `datos/` → **Add file → Upload files** → arrastrá el archivo → **Commit changes**.

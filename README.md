@@ -2,7 +2,7 @@
 
 Tablero para dar seguimiento al avance del Proyecto FARO (Wave 1): tareas por fase, horas por persona, vista ejecutiva e histórico de cortes.
 
-**👉 App publicada: https://aaronzaso.github.io/Seguimiento-FARO/**
+**👉 App actual: https://aaronzaso.github.io/Seguimiento-FARO/**
 
 No hay que instalar nada: se abre en el navegador. Cada quien trabaja en su navegador (los cambios se guardan localmente) y el avance del equipo se comparte con Excel a través de la carpeta [`datos/`](datos/).
 
@@ -29,7 +29,20 @@ npm install
 npm run dev
 ```
 
+## ☁️ Publicación automática con Vercel
+
+La carpeta `app/` también está preparada para desplegarse como un proyecto Vite en Vercel. En esa versión, el botón **☁️ Guardar corte** llama a `POST /api/cuts`, reconstruye el Excel del día y lo publica en `datos/` mediante un commit de GitHub. El token de GitHub nunca se entrega al navegador.
+
+Configuración requerida en **Vercel → Project Settings → Environment Variables**:
+
+- `GITHUB_TOKEN`: token fine-grained con acceso únicamente a `Aaronzaso/Seguimiento-FARO` y permiso **Contents: Read and write**.
+- `FARO_SAVE_TOKEN`: clave privada larga que se solicita al presionar **Guardar corte**.
+- `GITHUB_REPOSITORY`: `Aaronzaso/Seguimiento-FARO` (opcional; ya es el valor predeterminado).
+- `GITHUB_BRANCH`: `main` (opcional; ya es el valor predeterminado).
+
+El proyecto debe usar `app/` como raíz. Los valores reales se guardan en Vercel; [`app/.env.example`](app/.env.example) solo documenta los nombres y no contiene secretos.
+
 ## 🛠️ Estructura
 
-- [`app/`](app/) — la aplicación (React + Vite). Se despliega sola a GitHub Pages con cada push a `main` ([workflow](.github/workflows/deploy.yml)).
+- [`app/`](app/) — la aplicación React + Vite y la Function `/api/cuts`. GitHub Pages conserva la versión de solo lectura y Vercel habilita la publicación automática.
 - [`datos/`](datos/) — registro oficial del avance: los Excel exportados. El más reciente (por la fecha del nombre) es el que se publica en la página.
