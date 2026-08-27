@@ -1,3 +1,5 @@
+import { roundToTwo, sumNumbers } from "./numbers.js";
+
 // Grant Thornton Official Brand Colors
 export const GT = {
   purple: "#4F2D7F",
@@ -98,13 +100,16 @@ export const gph = n => PHASES.find(p => p.name === n) || PHASES[0];
 export const gtm = id => TEAM.find(t => t.id === id) || TEAM[0];
 export const sumH = hb => {
   if (!hb || typeof hb !== "object") return 0;
-  return Object.values(hb).reduce((s, v) => s + (parseFloat(v) || 0), 0);
+  return sumNumbers(Object.values(hb));
 };
 
 export function migrateTask(t) {
+  const sourceHours = (t.hoursBy && typeof t.hoursBy === "object") ? t.hoursBy : {};
   return {
     ...t,
-    hoursBy: (t.hoursBy && typeof t.hoursBy === "object") ? t.hoursBy : {},
+    hoursBy: Object.fromEntries(
+      Object.entries(sourceHours).map(([memberId, hours]) => [memberId, roundToTwo(hours)]),
+    ),
     responsible: Array.isArray(t.responsible) ? t.responsible : [],
     progress: typeof t.progress === "number" ? t.progress : 0,
     notes: t.notes || "",

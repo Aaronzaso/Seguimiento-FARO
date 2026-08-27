@@ -1,5 +1,6 @@
 import * as XLSX from "xlsx";
 import { TEAM, PHASES, sumH, gtm } from "./constants.js";
+import { parseNumber, roundToTwo, sumNumbers } from "./numbers.js";
 
 const HISTORY_SHEET_NAMES = ["histórico avance", "historico avance", "histórico", "historico"];
 const AUDIT_SHEET_NAMES = ["auditoría", "auditoria", "bitácora", "bitacora"];
@@ -12,7 +13,20 @@ const HISTORY_PHASE_COLUMNS = [
   { phase: "Migración de Datos", header: "Migración de datos" },
 ];
 
-const round1 = value => Math.round(value * 10) / 10;
+function formatNumericColumns(sheet, headers) {
+  if (!sheet["!ref"]) return;
+  const range = XLSX.utils.decode_range(sheet["!ref"]);
+  const targetHeaders = new Set(headers);
+
+  for (let column = range.s.c; column <= range.e.c; column += 1) {
+    const headerCell = sheet[XLSX.utils.encode_cell({ r: range.s.r, c: column })];
+    if (!targetHeaders.has(headerCell?.v)) continue;
+    for (let row = range.s.r + 1; row <= range.e.r; row += 1) {
+      const cell = sheet[XLSX.utils.encode_cell({ r: row, c: column })];
+      if (cell?.t === "n") cell.z = Number.isInteger(roundToTwo(cell.v)) ? "0" : "0.00";
+    }
+  }
+}
 
 export function todayKey() {
   const now = new Date();
@@ -56,7 +70,7 @@ function percentValue(value) {
     : Number(value);
   if (!Number.isFinite(numeric)) return 0;
   const normalized = !hasPercentSymbol && Math.abs(numeric) <= 1 ? numeric * 100 : numeric;
-  return round1(Math.max(0, Math.min(100, normalized)));
+  return roundToTwo(Math.max(0, Math.min(100, normalized)));
 }
 
 function calculateProgress(tasks) {
@@ -69,12 +83,12 @@ function calculateProgress(tasks) {
     const hours = phaseTasks.reduce((sum, task) => sum + task.hours, 0);
     const completed = phaseTasks.reduce((sum, task) => sum + task.hours * task.progress / 100, 0);
     phases[phase.name] = hours > 0
-      ? round1(completed / hours * 100)
+      ? roundToTwo(completed / hours * 100)
       : (phaseTasks.length > 0 && phaseTasks.every(task => task.progress === 100) ? 100 : 0);
   });
 
   return {
-    global: totalHours > 0 ? round1(completedHours / totalHours * 100) : 0,
+    global: totalHours > 0 ? roundToTwo(completedHours / totalHours * 100) : 0,
     phases,
   };
 }
@@ -123,7 +137,7 @@ export function createWorkbook(tasks, history = [], note = "", options = {}) {
 
     // Add per-person hours columns
     TEAM.forEach(m => {
-      row[`Horas ${m.name}`] = t.hoursBy?.[m.id] || 0;
+      row[`Horas ${m.name}`] = roundToTwo(t.hoursBy?.[m.id] || 0);
     });
 
     row["Total Horas Reales"] = tHL;
@@ -132,6 +146,11 @@ export function createWorkbook(tasks, history = [], note = "", options = {}) {
   });
 
   const ws = XLSX.utils.json_to_sheet(rows);
+  formatNumericColumns(ws, [
+    "Horas Plan",
+    ...TEAM.map(member => `Horas ${member.name}`),
+    "Total Horas Reales",
+  ]);
 
   // Column widths
   ws["!cols"] = [
@@ -173,7 +192,7 @@ export function createWorkbook(tasks, history = [], note = "", options = {}) {
     const pt = tasks.filter(t => t.phase === p.name);
     const pH = pt.reduce((s, t) => s + t.hours, 0);
     const pC = pt.reduce((s, t) => s + t.hours * t.progress / 100, 0);
-    const pHL = pt.reduce((s, t) => s + sumH(t.hoursBy), 0);
+    const pHL = sumNumbers(pt.map(t => sumH(t.hoursBy)));
     return {
       Fase: p.name,
       Tareas: pt.length,
@@ -185,13 +204,14 @@ export function createWorkbook(tasks, history = [], note = "", options = {}) {
   });
 
   const ws2 = XLSX.utils.json_to_sheet(summaryRows);
+  formatNumericColumns(ws2, ["Horas Plan", "Horas Reales"]);
   ws2["!cols"] = [{ wch: 24 }, { wch: 8 }, { wch: 12 }, { wch: 11 }, { wch: 13 }, { wch: 10 }];
   upsertSheet("Resumen", ws2);
 
   // Team sheet
   const teamRows = TEAM.map(m => {
     const mt = tasks.filter(t => t.responsible.includes(m.id));
-    const mHL = tasks.reduce((s, t) => s + (parseFloat(t.hoursBy?.[m.id]) || 0), 0);
+    const mHL = sumNumbers(tasks.map(t => t.hoursBy?.[m.id] || 0));
     return {
       Nombre: m.name,
       Rol: m.role,
@@ -202,6 +222,7 @@ export function createWorkbook(tasks, history = [], note = "", options = {}) {
   });
 
   const ws3 = XLSX.utils.json_to_sheet(teamRows);
+  formatNumericColumns(ws3, ["Horas Reales"]);
   ws3["!cols"] = [{ wch: 20 }, { wch: 6 }, { wch: 12 }, { wch: 16 }, { wch: 13 }];
   upsertSheet("Equipo", ws3);
 
@@ -236,7 +257,8 @@ export function createWorkbook(tasks, history = [], note = "", options = {}) {
     for (let row = 2; row <= historyRows.length + 1; row += 1) {
       ws4[`A${row}`].z = "dd/mm/yyyy";
       for (const col of ["B", "C", "D", "E", "F", "G", "H"]) {
-        ws4[`${col}${row}`].z = "0.0%";
+        const cell = ws4[`${col}${row}`];
+        if (cell) cell.z = Number.isInteger(roundToTwo(cell.v * 100)) ? "0%" : "0.00%";
       }
     }
   }
@@ -352,9 +374,9 @@ export function parseWorkbookUpdates(arrayBuffer) {
       const key = `Horas ${m.name}`;
       const val = row[key];
       if (val !== undefined && val !== null) {
-        const num = parseFloat(val);
-        if (!isNaN(num) && num >= 0) {
-          hoursBy[m.id] = num;
+        const num = parseNumber(val);
+        if (num !== null && num >= 0) {
+          hoursBy[m.id] = roundToTwo(num);
           hasHours = true;
         }
       }

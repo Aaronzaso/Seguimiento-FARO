@@ -9,6 +9,7 @@ import {
   saveCutToRemote,
 } from "./excel";
 import { getFaroSession, loginFaro, logoutFaro } from "./session";
+import { formatInputNumber, formatNumber, formatPercent, parseDecimalInput, roundToTwo, sumNumbers } from "./numbers";
 
 const SK = "faro-v6";
 
@@ -21,7 +22,7 @@ function tasksWithUpdates(tasks, updates = {}) {
     if (update.notes !== undefined) merged.notes = update.notes;
     if (update.hoursBy) merged.hoursBy = { ...task.hoursBy, ...update.hoursBy };
     if (update.responsible) merged.responsible = update.responsible;
-    return merged;
+    return migrateTask(merged);
   });
 }
 
@@ -34,10 +35,40 @@ function sameDraft(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function formatHours(value) {
-  return Number(value || 0).toLocaleString("es-CR", {
-    maximumFractionDigits: 1,
-  });
+const formatHours = formatNumber;
+
+function HoursInput({ value, label, onChange }) {
+  const normalized = roundToTwo(value);
+  const editing = useRef(false);
+  const [draft, setDraft] = useState(() => normalized === 0 ? "" : formatInputNumber(normalized));
+
+  useEffect(() => {
+    if (!editing.current) setDraft(normalized === 0 ? "" : formatInputNumber(normalized));
+  }, [normalized]);
+
+  const commit = rawValue => {
+    const parsed = parseDecimalInput(rawValue);
+    const next = parsed === null ? normalized : Math.min(10000, parsed);
+    editing.current = false;
+    onChange(next);
+    setDraft(next === 0 ? "" : formatInputNumber(next));
+  };
+
+  return (
+    <input type="text" inputMode="decimal" value={draft} placeholder="0" aria-label={label}
+      onFocus={() => { editing.current = true; }}
+      onChange={event => {
+        const nextDraft = event.target.value;
+        if (!/^\d*(?:[.,]\d{0,2})?$/.test(nextDraft)) return;
+        setDraft(nextDraft);
+        const parsed = parseDecimalInput(nextDraft);
+        if (parsed !== null) onChange(Math.min(10000, parsed));
+      }}
+      onBlur={event => commit(event.target.value)}
+      onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur(); }}
+      style={{ width: 62, padding: "3px 5px", borderRadius: 5, border: `1px solid ${GT.warmGreyLight}`,
+        fontSize: 12, fontWeight: 700, fontFamily: "'JetBrains Mono',monospace", textAlign: "center", background: "white" }} />
+  );
 }
 
 function DragBar({ value, color, onChange, h = 8 }) {
@@ -139,7 +170,7 @@ function DeadlineGauge({ globalPct }) {
         {/* Labels inside bar */}
         <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 3 }}>
           <span style={{ fontSize: 11, fontWeight: 700, color: "white", textShadow: "0 1px 3px rgba(0,0,0,.4)" }}>
-            Avance: {globalPct}% | Tiempo: {dl.timePct}%
+            Avance: {formatPercent(globalPct)} | Tiempo: {formatPercent(dl.timePct)}
           </span>
         </div>
       </div>
@@ -157,7 +188,7 @@ function DeadlineGauge({ globalPct }) {
         <div style={{ fontSize: 11, color: "#666" }}>
           <span style={{ fontWeight: 700 }}>Diferencia:</span>{" "}
           <span style={{ fontFamily: "'JetBrains Mono',monospace", fontWeight: 700, color: status.color }}>
-            {diff > 0 ? `+${diff}%` : `${diff}%`}
+            {diff > 0 ? `+${formatPercent(diff)}` : formatPercent(diff)}
           </span>
         </div>
       </div>
@@ -285,7 +316,7 @@ export default function App() {
   }, [tasks, note, history, baseVersion, baseSnapshot, ready]);
 
   const updateTask = useCallback((id, updates) => {
-    setTasks(prev => prev.map(t => t.id === id ? { ...t, ...updates } : t));
+    setTasks(prev => prev.map(t => t.id === id ? migrateTask({ ...t, ...updates }) : t));
   }, []);
 
   const loadLatestPublished = useCallback(async ({ confirmDiscard = true } = {}) => {
@@ -361,24 +392,24 @@ export default function App() {
   );
 
   const stats = useMemo(() => {
-    const tH = tasks.reduce((s, t) => s + t.hours, 0);
-    const cH = tasks.reduce((s, t) => s + t.hours * t.progress / 100, 0);
-    const hL = tasks.reduce((s, t) => s + sumH(t.hoursBy), 0);
+    const tH = sumNumbers(tasks.map(t => t.hours));
+    const cH = sumNumbers(tasks.map(t => t.hours * t.progress / 100));
+    const hL = sumNumbers(tasks.map(t => sumH(t.hoursBy)));
     const done = tasks.filter(t => t.progress === 100).length;
     const inP = tasks.filter(t => t.progress > 0 && t.progress < 100).length;
     const pend = tasks.filter(t => t.progress === 0).length;
     const phases = PHASES.map(p => {
       const pt = tasks.filter(t => t.phase === p.name);
-      const pH = pt.reduce((s, t) => s + t.hours, 0);
-      const pC = pt.reduce((s, t) => s + t.hours * t.progress / 100, 0);
-      const pHL = pt.reduce((s, t) => s + sumH(t.hoursBy), 0);
+      const pH = sumNumbers(pt.map(t => t.hours));
+      const pC = sumNumbers(pt.map(t => t.hours * t.progress / 100));
+      const pHL = sumNumbers(pt.map(t => sumH(t.hoursBy)));
       return { ...p, tasks: pt.length, hours: pH, hL: pHL, pct: pH > 0 ? Math.round(pC / pH * 100) : (pt.every(t => t.progress === 100) ? 100 : 0), done: pt.filter(t => t.progress === 100).length };
     });
     const ms = TEAM.map(m => {
       const mt = tasks.filter(t => Array.isArray(t.responsible) && t.responsible.includes(m.id));
-      const mH = mt.reduce((s, t) => s + t.hours, 0);
-      const mC = mt.reduce((s, t) => s + t.hours * t.progress / 100, 0);
-      const mHL = mt.reduce((s, t) => s + (parseFloat(t.hoursBy?.[m.id]) || 0), 0);
+      const mH = sumNumbers(mt.map(t => t.hours));
+      const mC = sumNumbers(mt.map(t => t.hours * t.progress / 100));
+      const mHL = sumNumbers(mt.map(t => t.hoursBy?.[m.id] || 0));
       return { ...m, tasks: mt.length, hours: mH, pct: mH > 0 ? Math.round(mC / mH * 100) : 0,
         done: mt.filter(t => t.progress === 100).length, inP: mt.filter(t => t.progress > 0 && t.progress < 100).length, hL: mHL };
     });
@@ -501,12 +532,12 @@ export default function App() {
             <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 2.5, opacity: .5, fontFamily: "'JetBrains Mono',monospace" }}>GRANT THORNTON · PROYECTO FARO · WAVE 1</div>
             <h1 style={{ margin: "4px 0 0", fontSize: 22, fontWeight: 800, letterSpacing: -.3 }}>Cronograma de Avance</h1>
             <div style={{ fontSize: 10, opacity: .4, marginTop: 3 }}>
-              Cierre: 16/11/2026 · {dl.remaining} días restantes · {stats.tH}h planificadas
+              Cierre: 16/11/2026 · {dl.remaining} días restantes · {formatHours(stats.tH)}h planificadas
             </div>
           </div>
           <div style={{ textAlign: "right" }}>
-            <div style={{ fontSize: 34, fontWeight: 800, fontFamily: "'JetBrains Mono',monospace", lineHeight: 1 }}>{stats.global}%</div>
-            <div style={{ fontSize: 10, opacity: .5, marginTop: 2 }}>{Math.round(stats.cH)}h de {stats.tH}h</div>
+            <div style={{ fontSize: 34, fontWeight: 800, fontFamily: "'JetBrains Mono',monospace", lineHeight: 1 }}>{formatPercent(stats.global)}</div>
+            <div style={{ fontSize: 10, opacity: .5, marginTop: 2 }}>{formatHours(stats.cH)}h de {formatHours(stats.tH)}h</div>
           </div>
         </div>
 
@@ -523,7 +554,7 @@ export default function App() {
           {stats.phases.map(p => (
             <div key={p.name} style={{ fontSize: 10, display: "flex", alignItems: "center", gap: 4, opacity: .7 }}>
               <span style={{ width: 7, height: 7, borderRadius: 2, background: p.color, display: "inline-block" }} />
-              {p.name} <span style={{ fontFamily: "'JetBrains Mono',monospace", fontWeight: 600 }}>{p.pct}%</span>
+              {p.name} <span style={{ fontFamily: "'JetBrains Mono',monospace", fontWeight: 600 }}>{formatPercent(p.pct)}</span>
             </div>
           ))}
         </div>
@@ -729,7 +760,7 @@ function AvanceTab({ tasks, filtered, fp, setFp, fm, setFm, exp, setExp, updateT
                   <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 20, marginBottom: 8 }}>
                     <span style={{ fontSize: 14 }}>{pi.icon}</span>
                     <span style={{ fontSize: 13, fontWeight: 800, color: pi.color }}>{task.phase}</span>
-                    <span style={{ fontSize: 11, color: GT.warmGrey }}>({stats.phases.find(p => p.name === task.phase)?.pct || 0}%)</span>
+                    <span style={{ fontSize: 11, color: GT.warmGrey }}>({formatPercent(stats.phases.find(p => p.name === task.phase)?.pct || 0)})</span>
                     <div style={{ flex: 1, height: 1, background: GT.warmGreyLight }} />
                   </div>
                 )}
@@ -743,8 +774,8 @@ function AvanceTab({ tasks, filtered, fp, setFp, fm, setFm, exp, setExp, updateT
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 12.5, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{task.name}</div>
                       <div style={{ fontSize: 10, color: "#999", marginTop: 1, display: "flex", gap: 5, alignItems: "center", flexWrap: "wrap" }}>
-                        <span style={{ fontWeight: 600, color: pi.color }}>{task.hours}h plan</span>
-                        {tHL > 0 && <><span style={{ opacity: .3 }}>·</span><span style={{ fontWeight: 600, color: GT.teal }}>{tHL}h real</span></>}
+                        <span style={{ fontWeight: 600, color: pi.color }}>{formatHours(task.hours)}h plan</span>
+                        {tHL > 0 && <><span style={{ opacity: .3 }}>·</span><span style={{ fontWeight: 600, color: GT.teal }}>{formatHours(tHL)}h real</span></>}
                         {task.notes && task.notes.length > 0 && <span style={{ color: pi.color }}>📝</span>}
                       </div>
                     </div>
@@ -753,7 +784,7 @@ function AvanceTab({ tasks, filtered, fp, setFp, fm, setFm, exp, setExp, updateT
                       <DragBar value={task.progress} color={pi.color} onChange={v => updateTask(task.id, { progress: v })} />
                     </div>
                     <div style={{ width: 32, textAlign: "right", fontSize: 11, fontWeight: 800, fontFamily: "'JetBrains Mono',monospace",
-                      color: task.progress === 100 ? GT.greenDark : task.progress > 0 ? pi.color : GT.warmGrey }}>{task.progress}%</div>
+                      color: task.progress === 100 ? GT.greenDark : task.progress > 0 ? pi.color : GT.warmGrey }}>{formatPercent(task.progress)}</div>
                     <Badge p={task.progress} />
                   </div>
 
@@ -787,14 +818,14 @@ function AvanceTab({ tasks, filtered, fp, setFp, fm, setFm, exp, setExp, updateT
                           <label style={lbl}>Avance</label>
                           <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 5 }}>
                             <div style={{ flex: 1 }}><DragBar value={task.progress} color={pi.color} onChange={v => updateTask(task.id, { progress: v })} h={11} /></div>
-                            <span style={{ fontSize: 14, fontWeight: 800, fontFamily: "'JetBrains Mono',monospace", color: pi.color }}>{task.progress}%</span>
+                            <span style={{ fontSize: 14, fontWeight: 800, fontFamily: "'JetBrains Mono',monospace", color: pi.color }}>{formatPercent(task.progress)}</span>
                           </div>
                           <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
                             {[0, 25, 50, 75, 100].map(v => (
                               <button key={v} onClick={() => updateTask(task.id, { progress: v })}
                                 style={{ padding: "3px 10px", borderRadius: 6, border: task.progress === v ? `2px solid ${pi.color}` : `1px solid ${GT.warmGreyLight}`,
                                   background: task.progress === v ? pi.bg : "white", fontSize: 10, fontWeight: 700, cursor: "pointer",
-                                  color: task.progress === v ? pi.color : "#999", fontFamily: "'JetBrains Mono',monospace" }}>{v}%</button>
+                                  color: task.progress === v ? pi.color : "#999", fontFamily: "'JetBrains Mono',monospace" }}>{formatPercent(v)}</button>
                             ))}
                           </div>
                         </div>
@@ -810,10 +841,8 @@ function AvanceTab({ tasks, filtered, fp, setFp, fm, setFm, exp, setExp, updateT
                                   <div style={{ width: 18, height: 18, borderRadius: "50%", background: m.color, display: "flex", alignItems: "center", justifyContent: "center",
                                     fontSize: 7, fontWeight: 800, color: "white", flexShrink: 0 }}>{m.short}</div>
                                   <span style={{ fontSize: 10.5, fontWeight: 600, flex: 1 }}>{m.name}</span>
-                                  <input type="number" min="0" step="0.5" value={val === 0 ? "" : val} placeholder="0"
-                                    onChange={e => updateTask(task.id, { hoursBy: { ...task.hoursBy, [pid]: parseFloat(e.target.value) || 0 } })}
-                                    style={{ width: 52, padding: "3px 5px", borderRadius: 5, border: `1px solid ${GT.warmGreyLight}`,
-                                      fontSize: 12, fontWeight: 700, fontFamily: "'JetBrains Mono',monospace", textAlign: "center", background: "white" }} />
+                                  <HoursInput value={val} label={`Horas reales de ${m.name}`}
+                                    onChange={hours => updateTask(task.id, { hoursBy: { ...task.hoursBy, [pid]: hours } })} />
                                   <span style={{ fontSize: 9, color: "#999" }}>h</span>
                                 </div>
                               );
@@ -821,7 +850,7 @@ function AvanceTab({ tasks, filtered, fp, setFp, fm, setFm, exp, setExp, updateT
                           </div>
                           {tHL > 0 && task.hours > 0 && (
                             <div style={{ marginTop: 5, fontSize: 10.5, fontWeight: 600, color: tHL > task.hours ? GT.red : GT.greenDark }}>
-                              Total: {tHL}h / {task.hours}h plan
+                              Total: {formatHours(tHL)}h / {formatHours(task.hours)}h plan
                             </div>
                           )}
                         </div>
@@ -851,8 +880,8 @@ function HistoryTab({ history }) {
   );
   const latest = cuts[0];
   const previous = cuts[1];
-  const latestDelta = latest && previous ? Math.round((latest.global - previous.global) * 10) / 10 : null;
-  const pct = value => `${Number(value || 0).toLocaleString("es-CR", { maximumFractionDigits: 1 })}%`;
+  const latestDelta = latest && previous ? roundToTwo(latest.global - previous.global) : null;
+  const pct = formatPercent;
   const cutDate = value => new Date(`${value}T12:00:00`).toLocaleDateString("es-CR", {
     day: "2-digit", month: "long", year: "numeric",
   });
@@ -902,7 +931,7 @@ function HistoryTab({ history }) {
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         {cuts.map((cut, index) => {
           const older = cuts[index + 1];
-          const delta = older ? Math.round((cut.global - older.global) * 10) / 10 : null;
+          const delta = older ? roundToTwo(cut.global - older.global) : null;
           return (
             <div key={`${cut.date}-${index}`} style={{ background: "white", borderRadius: 12, padding: "16px 18px", borderLeft: `4px solid ${index === 0 ? GT.purple : GT.warmGrey}` }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
@@ -963,7 +992,7 @@ function EjecTab({ stats, tasks, note, setNote }) {
       {/* KPIs */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(140px,1fr))", gap: 10, marginBottom: 22 }}>
         {[
-          { l: "Avance Global", v: `${stats.global}%`, s: `${Math.round(stats.cH)}h de ${stats.tH}h`, a: GT.purple },
+          { l: "Avance Global", v: formatPercent(stats.global), s: `${formatHours(stats.cH)}h de ${formatHours(stats.tH)}h`, a: GT.purple },
           { l: "Completadas", v: `${stats.done}`, s: `de ${tasks.length} tareas`, a: GT.greenDark },
           { l: "En Progreso", v: `${stats.inP}`, s: "tareas activas", a: GT.orange },
           { l: "Pendientes", v: `${stats.pend}`, s: "por iniciar", a: GT.warmGrey },
@@ -988,7 +1017,7 @@ function EjecTab({ stats, tasks, note, setNote }) {
                 <span style={{ fontSize: 12, fontWeight: 700, color: p.color }}>{p.name}</span>
                 <span style={{ fontSize: 10, color: GT.warmGrey }}>{p.done}/{p.tasks} · {formatHours(p.hours)}h plan{p.hL > 0 && ` · ${formatHours(p.hL)}h real`}</span>
               </div>
-              <span style={{ fontSize: 14, fontWeight: 800, fontFamily: "'JetBrains Mono',monospace", color: p.color, flexShrink: 0 }}>{p.pct}%</span>
+              <span style={{ fontSize: 14, fontWeight: 800, fontFamily: "'JetBrains Mono',monospace", color: p.color, flexShrink: 0 }}>{formatPercent(p.pct)}</span>
             </div>
             <div style={{ height: 10, background: p.bg, borderRadius: 5, overflow: "hidden" }}>
               <div style={{ width: `${p.pct}%`, height: "100%", background: p.color, borderRadius: 5, transition: "width .5s", opacity: .8 }} />
@@ -1013,7 +1042,7 @@ function EjecTab({ stats, tasks, note, setNote }) {
                 </div>
               </div>
               <div style={{ width: 40, flexShrink: 0 }}><div style={{ height: 4, background: GT.warmGreyLight, borderRadius: 2, overflow: "hidden" }}><div style={{ width: `${t.progress}%`, height: "100%", background: pi.color }} /></div></div>
-              <span style={{ fontSize: 10, fontWeight: 800, fontFamily: "'JetBrains Mono',monospace", color: pi.color, width: 28, textAlign: "right" }}>{t.progress}%</span>
+              <span style={{ fontSize: 10, fontWeight: 800, fontFamily: "'JetBrains Mono',monospace", color: pi.color, width: 28, textAlign: "right" }}>{formatPercent(t.progress)}</span>
             </div>
           ); })}
         </div>
@@ -1048,7 +1077,7 @@ function EjecTab({ stats, tasks, note, setNote }) {
               </div>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, marginBottom: 4 }}>
                 <span style={{ color: "#888" }}>{m.tasks} tareas</span>
-                <span style={{ fontWeight: 800, fontFamily: "'JetBrains Mono',monospace", color: m.color }}>{m.pct}%</span>
+                <span style={{ fontWeight: 800, fontFamily: "'JetBrains Mono',monospace", color: m.color }}>{formatPercent(m.pct)}</span>
               </div>
               <div style={{ height: 5, background: GT.warmGreyLight, borderRadius: 3, overflow: "hidden", marginBottom: 4 }}>
                 <div style={{ width: `${m.pct}%`, height: "100%", background: m.color, transition: "width .5s" }} />

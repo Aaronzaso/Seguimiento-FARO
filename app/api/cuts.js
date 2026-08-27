@@ -7,6 +7,7 @@ import {
   parseWorkbookHistory,
   workbookToArray,
 } from "../src/excel.js";
+import { roundToTwo } from "../src/numbers.js";
 import { assertTrustedOrigin, authenticateRequest, FaroAuthError } from "../lib/faro-auth.js";
 
 const DEFAULT_REPOSITORY = "Aaronzaso/Seguimiento-FARO";
@@ -75,7 +76,7 @@ export function normalizeSavePayload(body) {
     const hoursBy = {};
     TEAM.forEach(member => {
       const hours = finiteNumber(candidate.hoursBy?.[member.id], { min: 0, max: 10000 });
-      hoursBy[member.id] = hours ?? 0;
+      hoursBy[member.id] = roundToTwo(hours ?? 0);
     });
 
     return {
@@ -92,11 +93,11 @@ export function normalizeSavePayload(body) {
       if (!validDate(cut?.date)) return null;
       const phases = {};
       PHASE_NAMES.forEach(phase => {
-        phases[phase] = finiteNumber(cut.phases?.[phase], { min: 0, max: 100 }) ?? 0;
+        phases[phase] = roundToTwo(finiteNumber(cut.phases?.[phase], { min: 0, max: 100 }) ?? 0);
       });
       return {
         date: cut.date,
-        global: finiteNumber(cut.global, { min: 0, max: 100 }) ?? 0,
+        global: roundToTwo(finiteNumber(cut.global, { min: 0, max: 100 }) ?? 0),
         phases,
         branch: text(cut.branch, 100),
         commit: text(cut.commit, 100),

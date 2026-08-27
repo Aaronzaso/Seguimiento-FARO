@@ -57,6 +57,57 @@ test("normaliza un corte completo sin alterar la identidad de las tareas", () =>
   assert.equal(result.baseVersion, "datos/FARO_Cronograma_2026-08-13.xlsx:source-sha");
 });
 
+test("normaliza horas e histórico a centésimas antes de guardar", () => {
+  const tasks = INITIAL_TASKS.map(task => ({ ...task, hoursBy: {} }));
+  tasks.find(task => task.id === 23).hoursBy = {
+    aaron: 33.333,
+    luis_ma: 36.39999999999999,
+  };
+
+  const result = normalizeSavePayload({
+    date: "2026-08-27",
+    tasks,
+    history: [{
+      date: "2026-08-27",
+      global: 69.69999999999999,
+      phases: { Desarrollo: 69.69999999999999 },
+    }],
+  });
+
+  const reviewTask = result.tasks.find(task => task.id === 23);
+  assert.equal(reviewTask.hoursBy.aaron, 33.33);
+  assert.equal(reviewTask.hoursBy.luis_ma, 36.4);
+  assert.equal(result.history[0].global, 69.7);
+  assert.equal(result.history[0].phases.Desarrollo, 69.7);
+});
+
+test("exporta e importa horas sin colas binarias y con formato de centésimas", () => {
+  const tasks = INITIAL_TASKS.map(task => ({ ...task, hoursBy: {} }));
+  tasks.find(task => task.id === 23).hoursBy = { aaron: 33.3, luis_ma: 36.4 };
+
+  const { workbook } = createWorkbook(tasks, [], "", { date: "2026-08-27" });
+  const schedule = workbook.Sheets.Cronograma;
+  const scheduleRows = XLSX.utils.sheet_to_json(schedule);
+  const reviewRow = scheduleRows.find(row => row.ID === 23);
+  const summaryRows = XLSX.utils.sheet_to_json(workbook.Sheets.Resumen);
+  const developmentRow = summaryRows.find(row => row.Fase === "Desarrollo");
+
+  assert.equal(reviewRow["Total Horas Reales"], 69.7);
+  assert.equal(developmentRow["Horas Reales"], 69.7);
+  assert.equal(schedule.O24.z, "0.00");
+  assert.equal(schedule.D24.z, "0");
+
+  const updates = parseWorkbookUpdates(workbookToArray(workbook));
+  assert.equal(updates[23].hoursBy.aaron, 33.3);
+  assert.equal(updates[23].hoursBy.luis_ma, 36.4);
+
+  const localizedWorkbook = XLSX.utils.book_new();
+  const localizedSheet = XLSX.utils.json_to_sheet([{ ID: 23, "Horas Aarón Mayorga": "33,30" }]);
+  XLSX.utils.book_append_sheet(localizedWorkbook, localizedSheet, "Cronograma");
+  const localizedUpdates = parseWorkbookUpdates(XLSX.write(localizedWorkbook, { type: "array", bookType: "xlsx" }));
+  assert.equal(localizedUpdates[23].hoursBy.aaron, 33.3);
+});
+
 test("rechaza IDs de tareas duplicados", () => {
   const tasks = currentTasks();
   tasks[1] = { ...tasks[1], id: tasks[0].id };
