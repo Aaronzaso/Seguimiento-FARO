@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
-import { GT, PHASES, TEAM, INITIAL_TASKS, gph, gtm, sumH, migrateTask, getDeadlineStats, PROJECT_DEADLINE } from "./constants";
+import { GT, PHASES, TEAM, INITIAL_TASKS, gph, gtm, sumH, sumMemberHours, taskHourMemberIds, weightedProgress, migrateTask, getDeadlineStats, PROJECT_DEADLINE } from "./constants";
 import { storageGet, storageSet } from "./storage";
 import {
   exportToExcel,
@@ -34,6 +34,8 @@ function sameDraft(left, right) {
   if (!left || !right) return false;
   return JSON.stringify(left) === JSON.stringify(right);
 }
+
+const INITIAL_SNAPSHOT = draftSnapshot(INITIAL_TASKS, "");
 
 const formatHours = formatNumber;
 
@@ -248,21 +250,28 @@ export default function App() {
     (async () => {
       let hasLocal = false;
       let localBaseVersion = null;
+      let localIsClean = false;
       try {
         const raw = await storageGet(SK);
         if (!cancelled && raw) {
           const d = JSON.parse(raw);
           if (d.tasks && Array.isArray(d.tasks)) {
-            setTasks(d.tasks.map(migrateTask));
+            const localTasks = d.tasks.map(migrateTask);
+            setTasks(localTasks);
             hasLocal = true;
             localBaseVersion = typeof d.baseVersion === "string" ? d.baseVersion : null;
             setBaseVersion(localBaseVersion);
             if (d.baseSnapshot?.tasks && Array.isArray(d.baseSnapshot.tasks)) {
-              setBaseSnapshot(draftSnapshot(d.baseSnapshot.tasks.map(migrateTask), d.baseSnapshot.note));
+              const savedBase = draftSnapshot(d.baseSnapshot.tasks, d.baseSnapshot.note);
+              setBaseSnapshot(savedBase);
+              localIsClean = Boolean(localBaseVersion) && sameDraft(draftSnapshot(localTasks, d.note), savedBase);
             } else {
               setLegacyDraft(true);
             }
-            if (!localBaseVersion) setLegacyDraft(true);
+            if (!localBaseVersion) {
+              localIsClean = !d.history?.length && sameDraft(draftSnapshot(localTasks, d.note), INITIAL_SNAPSHOT);
+              setLegacyDraft(!localIsClean);
+            }
           }
           if (typeof d.note === "string") setNote(d.note);
           if (Array.isArray(d.history)) setHistory(d.history);
@@ -275,7 +284,7 @@ export default function App() {
         if (!cancelled && pub) {
           setPublished(pub);
           setRemoteMeta(pub);
-          if (!hasLocal) {
+          if (!hasLocal || localIsClean) {
             const publishedTasks = tasksWithUpdates(INITIAL_TASKS.map(migrateTask), pub.updates);
             const publishedNote = pub.history?.at(-1)?.notes || "";
             setTasks(publishedTasks);
@@ -284,7 +293,7 @@ export default function App() {
             setBaseVersion(pub.version);
             setBaseSnapshot(draftSnapshot(publishedTasks, publishedNote));
             setLegacyDraft(false);
-          } else if (localBaseVersion && localBaseVersion !== pub.version) {
+          } else if (localBaseVersion !== pub.version) {
             setConflict({
               code: "REMOTE_UPDATE",
               message: "Hay una versión publicada más reciente que este borrador.",
@@ -308,12 +317,12 @@ export default function App() {
 
   // Save (debounced)
   useEffect(() => {
-    if (!ready) return;
+    if (!ready || (!baseVersion && !legacyDraft && !history.length && sameDraft(currentSnapshot, INITIAL_SNAPSHOT))) return;
     const t = setTimeout(() => {
       storageSet(SK, JSON.stringify({ tasks, note, history, baseVersion, baseSnapshot }));
     }, 400);
     return () => clearTimeout(t);
-  }, [tasks, note, history, baseVersion, baseSnapshot, ready]);
+  }, [tasks, note, history, baseVersion, baseSnapshot, ready, currentSnapshot, legacyDraft]);
 
   const updateTask = useCallback((id, updates) => {
     setTasks(prev => prev.map(t => t.id === id ? migrateTask({ ...t, ...updates }) : t));
@@ -388,12 +397,11 @@ export default function App() {
 
   const filtered = tasks.filter(t =>
     (fp === "all" || t.phase === fp) &&
-    (fm === "all" || (Array.isArray(t.responsible) && t.responsible.includes(fm)))
+    (fm === "all" || taskHourMemberIds(t).includes(fm))
   );
 
   const stats = useMemo(() => {
     const tH = sumNumbers(tasks.map(t => t.hours));
-    const cH = sumNumbers(tasks.map(t => t.hours * t.progress / 100));
     const hL = sumNumbers(tasks.map(t => sumH(t.hoursBy)));
     const done = tasks.filter(t => t.progress === 100).length;
     const inP = tasks.filter(t => t.progress > 0 && t.progress < 100).length;
@@ -401,21 +409,20 @@ export default function App() {
     const phases = PHASES.map(p => {
       const pt = tasks.filter(t => t.phase === p.name);
       const pH = sumNumbers(pt.map(t => t.hours));
-      const pC = sumNumbers(pt.map(t => t.hours * t.progress / 100));
       const pHL = sumNumbers(pt.map(t => sumH(t.hoursBy)));
-      return { ...p, tasks: pt.length, hours: pH, hL: pHL, pct: pH > 0 ? Math.round(pC / pH * 100) : (pt.every(t => t.progress === 100) ? 100 : 0), done: pt.filter(t => t.progress === 100).length };
+      return { ...p, tasks: pt.length, hours: pH, hL: pHL, pct: weightedProgress(pt), done: pt.filter(t => t.progress === 100).length };
     });
     const ms = TEAM.map(m => {
       const mt = tasks.filter(t => Array.isArray(t.responsible) && t.responsible.includes(m.id));
       const mH = sumNumbers(mt.map(t => t.hours));
       const mC = sumNumbers(mt.map(t => t.hours * t.progress / 100));
-      const mHL = sumNumbers(mt.map(t => t.hoursBy?.[m.id] || 0));
+      const mHL = sumMemberHours(tasks, m.id);
       return { ...m, tasks: mt.length, hours: mH, pct: mH > 0 ? Math.round(mC / mH * 100) : 0,
         done: mt.filter(t => t.progress === 100).length, inP: mt.filter(t => t.progress > 0 && t.progress < 100).length, hL: mHL };
     });
     const active = tasks.filter(t => t.progress > 0 && t.progress < 100).sort((a, b) => b.progress - a.progress);
     const rd = tasks.filter(t => t.progress === 100 && t.hours > 0).sort((a, b) => b.id - a.id).slice(0, 10);
-    return { tH, cH, hL, global: tH > 0 ? Math.round(cH / tH * 100) : 0, done, inP, pend, phases, ms, active, rd };
+    return { tH, hL, global: weightedProgress(tasks), done, inP, pend, phases, ms, active, rd };
   }, [tasks]);
 
   // Import handler
@@ -520,6 +527,9 @@ export default function App() {
   };
 
   const dl = getDeadlineStats();
+  const hasNewerPublished = Boolean(remoteMeta?.version && remoteMeta.version !== baseVersion);
+
+  if (!ready) return <main aria-live="polite" style={{ padding: 24, fontFamily: "Segoe UI, sans-serif" }}>Cargando el corte de FARO…</main>;
 
   return (
     <div style={{ fontFamily: "'DM Sans','Segoe UI',sans-serif", background: GT.warmGreyBg, minHeight: "100vh", color: GT.black }}>
@@ -537,7 +547,7 @@ export default function App() {
           </div>
           <div style={{ textAlign: "right" }}>
             <div style={{ fontSize: 34, fontWeight: 800, fontFamily: "'JetBrains Mono',monospace", lineHeight: 1 }}>{formatPercent(stats.global)}</div>
-            <div style={{ fontSize: 10, opacity: .5, marginTop: 2 }}>{formatHours(stats.cH)}h de {formatHours(stats.tH)}h</div>
+            <div style={{ fontSize: 10, opacity: .65, marginTop: 2 }}>{formatHours(stats.hL)} h acumuladas</div>
           </div>
         </div>
 
@@ -606,7 +616,13 @@ export default function App() {
         </div>
       </div>
 
-      {(legacyDraft || conflict || (remoteMeta?.version && remoteMeta.version !== baseVersion)) && !isGitHubPages && (
+      {!published && (
+        <div role="status" style={{ padding: "8px 28px", background: "#FFF8E8", color: GT.black, fontSize: 12 }}>
+          No se pudo cargar el corte publicado. Estás viendo datos de este navegador o el cronograma inicial.
+        </div>
+      )}
+
+      {(legacyDraft || conflict || hasNewerPublished) && (
         <div role="alert" aria-live="assertive" style={{ padding: "11px 28px", background: conflict?.code === "VERSION_CONFLICT" ? GT.redBg : "#FFF8E8", borderBottom: `1px solid ${conflict?.code === "VERSION_CONFLICT" ? GT.red : GT.orange}35`, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
           <span style={{ fontSize: 16 }}>{conflict?.code === "VERSION_CONFLICT" ? "🛑" : "⚠️"}</span>
           <div style={{ flex: 1, minWidth: 220 }}>
@@ -645,7 +661,7 @@ export default function App() {
             🔄 Cargar
           </button>
           <span style={{ fontSize: 10, color: "#999" }}>
-            {isDirty ? "Tenés cambios en este navegador pendientes de publicar." : "Tu borrador coincide con la versión publicada."}
+            {hasNewerPublished ? "Hay una versión publicada más reciente que la que estás viendo." : isDirty ? "Tenés cambios en este navegador pendientes de publicar." : "Estás viendo el corte publicado."}
           </span>
         </div>
       )}
@@ -775,7 +791,7 @@ function AvanceTab({ tasks, filtered, fp, setFp, fm, setFm, exp, setExp, updateT
                       <div style={{ fontSize: 12.5, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{task.name}</div>
                       <div style={{ fontSize: 10, color: "#999", marginTop: 1, display: "flex", gap: 5, alignItems: "center", flexWrap: "wrap" }}>
                         <span style={{ fontWeight: 600, color: pi.color }}>{formatHours(task.hours)}h plan</span>
-                        {tHL > 0 && <><span style={{ opacity: .3 }}>·</span><span style={{ fontWeight: 600, color: GT.teal }}>{formatHours(tHL)}h real</span></>}
+                        {tHL > 0 && <><span style={{ opacity: .3 }}>·</span><span style={{ fontWeight: 600, color: GT.teal }}>{formatHours(tHL)} h acumuladas</span></>}
                         {task.notes && task.notes.length > 0 && <span style={{ color: pi.color }}>📝</span>}
                       </div>
                     </div>
@@ -830,9 +846,9 @@ function AvanceTab({ tasks, filtered, fp, setFp, fm, setFm, exp, setExp, updateT
                           </div>
                         </div>
                         <div>
-                          <label style={lbl}>Horas reales por persona</label>
+                          <label style={lbl}>Horas acumuladas por persona</label>
                           <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 5 }}>
-                            {task.responsible.map(pid => {
+                            {taskHourMemberIds(task).map(pid => {
                               const m = gtm(pid);
                               const val = task.hoursBy?.[pid] || 0;
                               return (
@@ -841,7 +857,7 @@ function AvanceTab({ tasks, filtered, fp, setFp, fm, setFm, exp, setExp, updateT
                                   <div style={{ width: 18, height: 18, borderRadius: "50%", background: m.color, display: "flex", alignItems: "center", justifyContent: "center",
                                     fontSize: 7, fontWeight: 800, color: "white", flexShrink: 0 }}>{m.short}</div>
                                   <span style={{ fontSize: 10.5, fontWeight: 600, flex: 1 }}>{m.name}</span>
-                                  <HoursInput value={val} label={`Horas reales de ${m.name}`}
+                                  <HoursInput value={val} label={`Horas acumuladas de ${m.name}`}
                                     onChange={hours => updateTask(task.id, { hoursBy: { ...task.hoursBy, [pid]: hours } })} />
                                   <span style={{ fontSize: 9, color: "#999" }}>h</span>
                                 </div>
@@ -992,11 +1008,11 @@ function EjecTab({ stats, tasks, note, setNote }) {
       {/* KPIs */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(140px,1fr))", gap: 10, marginBottom: 22 }}>
         {[
-          { l: "Avance Global", v: formatPercent(stats.global), s: `${formatHours(stats.cH)}h de ${formatHours(stats.tH)}h`, a: GT.purple },
+          { l: "Avance Global", v: formatPercent(stats.global), s: "Ponderado por horas planificadas", a: GT.purple },
           { l: "Completadas", v: `${stats.done}`, s: `de ${tasks.length} tareas`, a: GT.greenDark },
           { l: "En Progreso", v: `${stats.inP}`, s: "tareas activas", a: GT.orange },
           { l: "Pendientes", v: `${stats.pend}`, s: "por iniciar", a: GT.warmGrey },
-          { l: "Horas Reales", v: formatHours(stats.hL), s: `de ${formatHours(stats.tH)}h plan`, a: GT.teal },
+          { l: "Horas acumuladas", v: formatHours(stats.hL), s: "Incluye estimaciones por corte", a: GT.teal },
         ].map((k, i) => (
           <div key={i} style={{ background: "white", borderRadius: 12, padding: "14px 12px", borderTop: `3px solid ${k.a}`, minWidth: 0 }}>
             <div style={{ fontSize: 9, fontWeight: 700, color: "#999", textTransform: "uppercase", letterSpacing: 1 }}>{k.l}</div>
@@ -1015,7 +1031,7 @@ function EjecTab({ stats, tasks, note, setNote }) {
               <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", minWidth: 0 }}>
                 <span style={{ width: 9, height: 9, borderRadius: 3, background: p.bg, border: `1.5px solid ${p.color}`, display: "inline-block" }} />
                 <span style={{ fontSize: 12, fontWeight: 700, color: p.color }}>{p.name}</span>
-                <span style={{ fontSize: 10, color: GT.warmGrey }}>{p.done}/{p.tasks} · {formatHours(p.hours)}h plan{p.hL > 0 && ` · ${formatHours(p.hL)}h real`}</span>
+                <span style={{ fontSize: 10, color: GT.warmGrey }}>{p.done}/{p.tasks} · {formatHours(p.hours)} h plan{p.hL > 0 && ` · ${formatHours(p.hL)} h acumuladas`}</span>
               </div>
               <span style={{ fontSize: 14, fontWeight: 800, fontFamily: "'JetBrains Mono',monospace", color: p.color, flexShrink: 0 }}>{formatPercent(p.pct)}</span>
             </div>
@@ -1038,7 +1054,7 @@ function EjecTab({ stats, tasks, note, setNote }) {
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontSize: 11, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.name}</div>
                 <div style={{ fontSize: 9.5, color: "#aaa", display: "flex", gap: 3, alignItems: "center" }}>
-                  <Avatars ids={t.responsible} size={14} /><span>{formatHours(t.hours)}h{h > 0 && ` · ${formatHours(h)}h real`}</span>
+                  <Avatars ids={t.responsible} size={14} /><span>{formatHours(t.hours)} h plan{h > 0 && ` · ${formatHours(h)} h acumuladas`}</span>
                 </div>
               </div>
               <div style={{ width: 40, flexShrink: 0 }}><div style={{ height: 4, background: GT.warmGreyLight, borderRadius: 2, overflow: "hidden" }}><div style={{ width: `${t.progress}%`, height: "100%", background: pi.color }} /></div></div>
@@ -1056,7 +1072,7 @@ function EjecTab({ stats, tasks, note, setNote }) {
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontSize: 11, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.name}</div>
                 <div style={{ fontSize: 9.5, color: "#aaa", display: "flex", gap: 3, alignItems: "center" }}>
-                  <Avatars ids={t.responsible} size={13} /><span>{formatHours(t.hours)}h{h > 0 && ` · ${formatHours(h)}h real`} · {pi.name}</span>
+                  <Avatars ids={t.responsible} size={13} /><span>{formatHours(t.hours)} h plan{h > 0 && ` · ${formatHours(h)} h acumuladas`} · {pi.name}</span>
                 </div>
               </div>
             </div>
@@ -1068,7 +1084,7 @@ function EjecTab({ stats, tasks, note, setNote }) {
       <div style={{ background: "white", borderRadius: 12, padding: 18, marginBottom: 18 }}>
         <h3 style={{ margin: "0 0 12px", fontSize: 14, fontWeight: 800, color: GT.purple }}>👥 Equipo</h3>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(min(195px,100%),1fr))", gap: 10 }}>
-          {stats.ms.filter(m => m.tasks > 0).map(m => (
+          {stats.ms.filter(m => m.tasks > 0 || m.hL > 0).map(m => (
             <div key={m.id} style={{ padding: 12, borderRadius: 10, border: `1px solid ${GT.warmGreyLight}`, background: GT.warmGreyBg }}>
               <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 8 }}>
                 <div style={{ width: 30, height: 30, borderRadius: "50%", background: m.color, display: "flex", alignItems: "center", justifyContent: "center",
@@ -1083,7 +1099,7 @@ function EjecTab({ stats, tasks, note, setNote }) {
                 <div style={{ width: `${m.pct}%`, height: "100%", background: m.color, transition: "width .5s" }} />
               </div>
               <div style={{ fontSize: 9.5, color: "#aaa" }}>✅{m.done} · 🔵{m.inP} · ⬜{m.tasks - m.done - m.inP}</div>
-              {m.hL > 0 && <div style={{ fontSize: 10, color: m.color, fontWeight: 700, marginTop: 3, fontFamily: "'JetBrains Mono',monospace" }}>{formatHours(m.hL)}h reales</div>}
+              {m.hL > 0 && <div style={{ fontSize: 10, color: m.color, fontWeight: 700, marginTop: 3, fontFamily: "'JetBrains Mono',monospace" }}>{formatHours(m.hL)} h acumuladas</div>}
             </div>
           ))}
         </div>

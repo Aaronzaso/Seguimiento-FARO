@@ -124,13 +124,16 @@ function requireCurrentCutDate(date) {
   }
 }
 
-function githubConfig() {
+function githubConfig({ publicRead = false } = {}) {
   const token = process.env.GITHUB_TOKEN;
-  if (!token) throw new HttpError(503, "Falta configurar GITHUB_TOKEN en Vercel.");
+  const repository = process.env.GITHUB_REPOSITORY || DEFAULT_REPOSITORY;
+  const allowPublicRead = publicRead && repository.toLowerCase() === DEFAULT_REPOSITORY.toLowerCase();
+  if (!token && !allowPublicRead) throw new HttpError(503, "Falta configurar GITHUB_TOKEN en Vercel.");
   return {
     token,
-    repository: process.env.GITHUB_REPOSITORY || DEFAULT_REPOSITORY,
+    repository,
     branch: process.env.GITHUB_BRANCH || DEFAULT_BRANCH,
+    allowPublicRead,
   };
 }
 
@@ -139,16 +142,21 @@ function encodedPath(path) {
 }
 
 async function githubRequest(config, path, options = {}) {
-  const response = await fetch(`https://api.github.com/repos/${config.repository}/${path}`, {
+  const request = token => fetch(`https://api.github.com/repos/${config.repository}/${path}`, {
     ...options,
     headers: {
       Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${config.token}`,
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       "X-GitHub-Api-Version": GITHUB_API_VERSION,
       "User-Agent": "FARO-Vercel",
       ...options.headers,
     },
   });
+  let response = await request(config.token);
+  if (response.status === 401 && config.token && config.allowPublicRead && (options.method ?? "GET") === "GET") {
+    config.token = null;
+    response = await request(null);
+  }
 
   if (response.status === 404 && options.allowNotFound) return null;
   const payload = await response.json().catch(() => ({}));
@@ -223,7 +231,7 @@ function setCutHeaders(res, file, metadata) {
 }
 
 async function serveLatestCut(req, res) {
-  const config = githubConfig();
+  const config = githubConfig({ publicRead: true });
   const workbooks = await listWorkbooks(config);
   const latest = workbooks.at(-1);
   if (!latest) throw new HttpError(404, "Todavía no hay cortes publicados.");

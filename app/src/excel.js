@@ -1,5 +1,5 @@
 import * as XLSX from "xlsx";
-import { TEAM, PHASES, sumH, gtm } from "./constants.js";
+import { TEAM, PHASES, sumH, sumMemberHours, weightedProgress, gtm } from "./constants.js";
 import { parseNumber, roundToTwo, sumNumbers } from "./numbers.js";
 
 const HISTORY_SHEET_NAMES = ["histórico avance", "historico avance", "histórico", "historico"];
@@ -74,21 +74,15 @@ function percentValue(value) {
 }
 
 function calculateProgress(tasks) {
-  const totalHours = tasks.reduce((sum, task) => sum + task.hours, 0);
-  const completedHours = tasks.reduce((sum, task) => sum + task.hours * task.progress / 100, 0);
   const phases = {};
 
   PHASES.forEach(phase => {
     const phaseTasks = tasks.filter(task => task.phase === phase.name);
-    const hours = phaseTasks.reduce((sum, task) => sum + task.hours, 0);
-    const completed = phaseTasks.reduce((sum, task) => sum + task.hours * task.progress / 100, 0);
-    phases[phase.name] = hours > 0
-      ? roundToTwo(completed / hours * 100)
-      : (phaseTasks.length > 0 && phaseTasks.every(task => task.progress === 100) ? 100 : 0);
+    phases[phase.name] = weightedProgress(phaseTasks);
   });
 
   return {
-    global: totalHours > 0 ? roundToTwo(completedHours / totalHours * 100) : 0,
+    global: weightedProgress(tasks),
     phases,
   };
 }
@@ -140,7 +134,7 @@ export function createWorkbook(tasks, history = [], note = "", options = {}) {
       row[`Horas ${m.name}`] = roundToTwo(t.hoursBy?.[m.id] || 0);
     });
 
-    row["Total Horas Reales"] = tHL;
+    row["Total horas acumuladas"] = tHL;
     row["Notas"] = t.notes || "";
     return row;
   });
@@ -149,7 +143,7 @@ export function createWorkbook(tasks, history = [], note = "", options = {}) {
   formatNumericColumns(ws, [
     "Horas Plan",
     ...TEAM.map(member => `Horas ${member.name}`),
-    "Total Horas Reales",
+    "Total horas acumuladas",
   ]);
 
   // Column widths
@@ -162,7 +156,7 @@ export function createWorkbook(tasks, history = [], note = "", options = {}) {
     { wch: 10 },  // Estado
     { wch: 35 },  // Responsables
     ...TEAM.map(() => ({ wch: 14 })),
-    { wch: 16 },  // Total
+    { wch: 24 },  // Total
     { wch: 40 },  // Notas
   ];
 
@@ -191,39 +185,38 @@ export function createWorkbook(tasks, history = [], note = "", options = {}) {
   const summaryRows = PHASES.map(p => {
     const pt = tasks.filter(t => t.phase === p.name);
     const pH = pt.reduce((s, t) => s + t.hours, 0);
-    const pC = pt.reduce((s, t) => s + t.hours * t.progress / 100, 0);
     const pHL = sumNumbers(pt.map(t => sumH(t.hoursBy)));
     return {
       Fase: p.name,
       Tareas: pt.length,
       Completadas: pt.filter(t => t.progress === 100).length,
       "Horas Plan": pH,
-      "Horas Reales": pHL,
-      "Avance %": pH > 0 ? Math.round(pC / pH * 100) : 0,
+      "Horas acumuladas": pHL,
+      "Avance %": weightedProgress(pt),
     };
   });
 
   const ws2 = XLSX.utils.json_to_sheet(summaryRows);
-  formatNumericColumns(ws2, ["Horas Plan", "Horas Reales"]);
-  ws2["!cols"] = [{ wch: 24 }, { wch: 8 }, { wch: 12 }, { wch: 11 }, { wch: 13 }, { wch: 10 }];
+  formatNumericColumns(ws2, ["Horas Plan", "Horas acumuladas"]);
+  ws2["!cols"] = [{ wch: 24 }, { wch: 8 }, { wch: 12 }, { wch: 11 }, { wch: 19 }, { wch: 10 }];
   upsertSheet("Resumen", ws2);
 
   // Team sheet
   const teamRows = TEAM.map(m => {
     const mt = tasks.filter(t => t.responsible.includes(m.id));
-    const mHL = sumNumbers(tasks.map(t => t.hoursBy?.[m.id] || 0));
+    const mHL = sumMemberHours(tasks, m.id);
     return {
       Nombre: m.name,
       Rol: m.role,
       Dedicación: m.ded,
       "Tareas Asignadas": mt.length,
-      "Horas Reales": mHL,
+      "Horas acumuladas": mHL,
     };
   });
 
   const ws3 = XLSX.utils.json_to_sheet(teamRows);
-  formatNumericColumns(ws3, ["Horas Reales"]);
-  ws3["!cols"] = [{ wch: 20 }, { wch: 6 }, { wch: 12 }, { wch: 16 }, { wch: 13 }];
+  formatNumericColumns(ws3, ["Horas acumuladas"]);
+  ws3["!cols"] = [{ wch: 20 }, { wch: 6 }, { wch: 12 }, { wch: 16 }, { wch: 19 }];
   upsertSheet("Equipo", ws3);
 
   // History sheet: one row per review date. Exporting again on the same day updates that day's cut.

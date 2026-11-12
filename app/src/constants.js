@@ -102,6 +102,20 @@ export const sumH = hb => {
   if (!hb || typeof hb !== "object") return 0;
   return sumNumbers(Object.values(hb));
 };
+export const sumMemberHours = (tasks, memberId) =>
+  sumNumbers(tasks.map(task => task.hoursBy?.[memberId] ?? 0));
+
+export const taskHourMemberIds = task => TEAM
+  .filter(member => task.responsible?.includes(member.id) || (task.hoursBy?.[member.id] ?? 0) > 0)
+  .map(member => member.id);
+
+export function weightedProgress(tasks) {
+  const planned = sumNumbers(tasks.map(task => task.hours));
+  const complete = sumNumbers(tasks.map(task => task.hours * task.progress / 100));
+  return planned > 0
+    ? Math.round(complete / planned * 1000) / 10
+    : tasks.length > 0 && tasks.every(task => task.progress === 100) ? 100 : 0;
+}
 
 export function migrateTask(t) {
   const sourceHours = (t.hoursBy && typeof t.hoursBy === "object") ? t.hoursBy : {};

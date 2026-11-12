@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 import * as XLSX from "xlsx";
-import { INITIAL_TASKS } from "../src/constants.js";
+import { INITIAL_TASKS, sumMemberHours, taskHourMemberIds } from "../src/constants.js";
 import {
   createWorkbook,
   parseWorkbookAudit,
@@ -92,8 +92,8 @@ test("exporta e importa horas sin colas binarias y con formato de centésimas", 
   const summaryRows = XLSX.utils.sheet_to_json(workbook.Sheets.Resumen);
   const developmentRow = summaryRows.find(row => row.Fase === "Desarrollo");
 
-  assert.equal(reviewRow["Total Horas Reales"], 69.7);
-  assert.equal(developmentRow["Horas Reales"], 69.7);
+  assert.equal(reviewRow["Total horas acumuladas"], 69.7);
+  assert.equal(developmentRow["Horas acumuladas"], 69.7);
   assert.equal(schedule.O24.z, "0.00");
   assert.equal(schedule.D24.z, "0");
 
@@ -106,6 +106,23 @@ test("exporta e importa horas sin colas binarias y con formato de centésimas", 
   XLSX.utils.book_append_sheet(localizedWorkbook, localizedSheet, "Cronograma");
   const localizedUpdates = parseWorkbookUpdates(XLSX.write(localizedWorkbook, { type: "array", bookType: "xlsx" }));
   assert.equal(localizedUpdates[23].hoursBy.aaron, 33.3);
+});
+
+test("incluye contribuciones aunque la persona no figure como responsable", () => {
+  const tasks = INITIAL_TASKS.map(task => ({ ...task, hoursBy: {} }));
+  const [first, second] = tasks;
+  first.responsible = ["aaron"];
+  first.hoursBy = { aaron: 1.25, daniel: 4.5 };
+  second.responsible = [];
+  second.hoursBy = { daniel: 2.25 };
+
+  const { workbook } = createWorkbook(tasks, [], "", { date: "2026-11-12" });
+  const teamRows = XLSX.utils.sheet_to_json(workbook.Sheets.Equipo);
+  const daniel = teamRows.find(row => row.Nombre === "Daniel Pulido");
+  assert.equal(sumMemberHours(tasks, "daniel"), 6.75);
+  assert.equal(daniel["Horas acumuladas"], 6.75);
+  assert.deepEqual(taskHourMemberIds(first), ["aaron", "daniel"]);
+  assert.deepEqual(taskHourMemberIds(second), ["daniel"]);
 });
 
 test("rechaza IDs de tareas duplicados", () => {
@@ -412,11 +429,17 @@ test("acepta aliases same-origin de Vercel y rechaza sitios externos", () => {
   );
 });
 
-test("expone metadatos de versión sin descargar el Excel en el cliente", async () => {
+test("permite leer los metadatos del corte público cuando caduca el token de publicación", async () => {
   const originalFetch = global.fetch;
   const originalToken = process.env.GITHUB_TOKEN;
+  const originalRepository = process.env.GITHUB_REPOSITORY;
   process.env.GITHUB_TOKEN = "github-test-token";
-  global.fetch = async url => {
+  process.env.GITHUB_REPOSITORY = "Aaronzaso/Seguimiento-FARO";
+  const authenticatedReads = [];
+  global.fetch = async (url, options) => {
+    authenticatedReads.push(Boolean(options.headers.Authorization));
+    assert.equal(options.method ?? "GET", "GET");
+    if (options.headers.Authorization) return Response.json({ message: "Bad credentials" }, { status: 401 });
     const requestUrl = String(url);
     if (requestUrl.includes("/contents/datos?ref=")) {
       return Response.json([{
@@ -446,10 +469,13 @@ test("expone metadatos de versión sin descargar el Excel en el cliente", async 
     assert.equal(response.statusCode, 200);
     assert.equal(response.body.version, `${TARGET_PATH}:source-sha`);
     assert.equal(response.headers["X-Faro-Version"], response.body.version);
+    assert.deepEqual(authenticatedReads, [true, false, false]);
   } finally {
     global.fetch = originalFetch;
     if (originalToken === undefined) delete process.env.GITHUB_TOKEN;
     else process.env.GITHUB_TOKEN = originalToken;
+    if (originalRepository === undefined) delete process.env.GITHUB_REPOSITORY;
+    else process.env.GITHUB_REPOSITORY = originalRepository;
   }
 });
 
